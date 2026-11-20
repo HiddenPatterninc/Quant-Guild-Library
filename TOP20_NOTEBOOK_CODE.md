@@ -10,7 +10,7 @@ Code cells only (no outputs), in notebook order. Source paths are given for each
 4. **How to Trade Implied Volatility Crush (Lecture 43)** — Model and trade the post-event implied-volatility crush.
 5. **Trading Mean Reversion with Kalman Filters (Lecture 95)** — Mean-reversion strategy using Kalman filters.
 6. **How to Trade the Covered Call (Lecture 106)** — Covered call payoff and risk analysis.
-7. **How to Trade the Cash Secured Puts (Lecture 113)** — Cash-secured put; uses Interactive Brokers (ibapi).
+7. **How to Trade the Cash Secured Puts (Lecture 113)** — Cash-secured put / volatility risk premium analysis. The original IB data download is replaced with yfinance (SPY prices + VIX as the implied-vol proxy).
 8. **Volatility Risk Premium How Options Markets Price Fear (Lecture 119)** — Volatility risk premium: realized vs implied vol.
 9. **How to Protect your Stock Portfolio Against a Market Crash (Lecture 138)** — Hedging a stock portfolio against a crash.
 10. **Master Volatility with ARCH & GARCH Models (Lecture 47)** — ARCH/GARCH volatility fitting and forecasting.
@@ -22,7 +22,7 @@ Code cells only (no outputs), in notebook order. Source paths are given for each
 16. **How to Trade with the Kelly Criterion (Lecture 36)** — Kelly criterion bet sizing.
 17. **Black-Litterman vs. Mean-Variance Portfolio Optimization in Python (Lecture 100)** — Black-Litterman vs mean-variance optimization.
 18. **How a Quant Manages a Portfolio (Lecture 88)** — Factor-model portfolio management.
-19. **How to Calculate Portfolio Alpha & Beta (Python + Interactive Brokers) (Lecture 128)** — Portfolio alpha and beta (Interactive Brokers).
+19. **How to Calculate Portfolio Alpha & Beta (Lecture 128)** — Portfolio alpha and beta via CAPM regression on simulated data. (The notebook folder's IB-only get_portfolio_data.py is excluded.)
 20. **3 Backtesting Pitfalls That Ruin Your Strategy (Lecture 97)** — Three backtesting pitfalls.
 
 ---
@@ -2263,7 +2263,7 @@ fig.show()
 
 ## 7. How to Trade the Cash Secured Puts (Lecture 113)
 
-`2026 Video Lectures/113. How to Trade the Cash Secured Puts/httcc.ipynb` — Cash-secured put; uses Interactive Brokers (ibapi).
+`2026 Video Lectures/113. How to Trade the Cash Secured Puts/httcc.ipynb` — Cash-secured put / volatility risk premium analysis. The original IB data download is replaced with yfinance (SPY prices + VIX as the implied-vol proxy).
 
 ```python
 import numpy as np
@@ -3220,160 +3220,18 @@ fig.show()
 ```
 
 ```python
-import threading
 import time
 import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
+import yfinance as yf  # replaces the Interactive Brokers (ibapi) data download
 
-from ibapi.client import EClient
-from ibapi.wrapper import EWrapper
-from ibapi.contract import Contract
-
-
-# ============================================================
-# --- 1. IBKR APP ---
-# ============================================================
-
-class IBApp(EWrapper, EClient):
-    def __init__(self):
-        EClient.__init__(self, self)
-
-        self.data = {}
-        self.done = {}
-
-    def historicalData(self, reqId, bar):
-        if reqId not in self.data:
-            self.data[reqId] = []
-
-        self.data[reqId].append({
-            "date": bar.date,
-            "open": float(bar.open),
-            "high": float(bar.high),
-            "low": float(bar.low),
-            "close": float(bar.close),
-            "volume": float(bar.volume)
-        })
-
-    def historicalDataEnd(self, reqId, start, end):
-        self.done[reqId] = True
-
-
-# ============================================================
-# --- 2. CONTRACT SETUP ---
-# ============================================================
-
-def spy_contract():
-    contract = Contract()
-    contract.symbol = "SPY"
-    contract.secType = "STK"
-    contract.exchange = "SMART"
-    contract.currency = "USD"
-    contract.primaryExchange = "ARCA"
-    return contract
-
-
-# ============================================================
-# --- 3. DATA REQUEST HELPERS ---
-# ============================================================
-
-def run_loop(app):
-    app.run()
-
-
-def wait_for_data(app, req_id, timeout=60):
-    start = time.time()
-
-    while not app.done.get(req_id, False):
-        if time.time() - start > timeout:
-            raise TimeoutError(f"Timed out waiting for request {req_id}")
-        time.sleep(0.25)
-
-
-def clean_ib_df(raw_data):
-    df = pd.DataFrame(raw_data)
-
-    df["date"] = pd.to_datetime(df["date"], format="%Y%m%d")
-    df = df.sort_values("date")
-    df = df.set_index("date")
-
-    return df
-
-
-# ============================================================
-# --- 4. CONNECT TO IBKR ---
-# ============================================================
-
-app = IBApp()
-
-# TWS default port: 7497
-# IB Gateway paper: 4002
-# IB Gateway live: 4001
-app.connect("127.0.0.1", 7497, clientId=7)
-
-thread = threading.Thread(target=run_loop, args=(app,), daemon=True)
-thread.start()
-
-time.sleep(1)
-
-
-# ============================================================
-# --- 5. REQUEST HISTORICAL SPY PRICE DATA ---
-# ============================================================
-
-contract = spy_contract()
-
-price_req_id = 1
-
-app.reqHistoricalData(
-    reqId=price_req_id,
-    contract=contract,
-    endDateTime="",
-    durationStr="5 Y",
-    barSizeSetting="1 day",
-    whatToShow="TRADES",
-    useRTH=1,
-    formatDate=1,
-    keepUpToDate=False,
-    chartOptions=[]
-)
-
-wait_for_data(app, price_req_id)
-
-price_df = clean_ib_df(app.data[price_req_id])
-price_df = price_df.rename(columns={"close": "spy_close"})
-
-
-# ============================================================
-# --- 6. REQUEST HISTORICAL IMPLIED VOLATILITY ---
-# ============================================================
-
-iv_req_id = 2
-
-app.reqHistoricalData(
-    reqId=iv_req_id,
-    contract=contract,
-    endDateTime="",
-    durationStr="5 Y",
-    barSizeSetting="1 day",
-    whatToShow="OPTION_IMPLIED_VOLATILITY",
-    useRTH=1,
-    formatDate=1,
-    keepUpToDate=False,
-    chartOptions=[]
-)
-
-wait_for_data(app, iv_req_id)
-
-iv_df = clean_ib_df(app.data[iv_req_id])
-iv_df = iv_df.rename(columns={"close": "implied_vol"})
-
-
-# ============================================================
-# --- 7. DISCONNECT FROM IBKR ---
-# ============================================================
-
-app.disconnect()
+# --- DATA: SPY prices and VIX (30-day implied vol proxy) from Yahoo Finance ---
+raw = yf.download(["SPY", "^VIX"], period="5y", interval="1d", auto_adjust=True, progress=False)
+price_df = pd.DataFrame({"spy_close": raw["Close"]["SPY"]})
+iv_df = pd.DataFrame({"implied_vol": raw["Close"]["^VIX"] / 100.0})  # decimals
+price_df.index = pd.to_datetime(price_df.index).tz_localize(None)
+iv_df.index = pd.to_datetime(iv_df.index).tz_localize(None)
 
 
 # ============================================================
@@ -3397,7 +3255,7 @@ df["forward_30d_realized_vol"] = (
 
 df = df.dropna()
 
-# Convert to percentages if IBKR returns decimals
+# Convert to percentages if the IV series is in decimals
 if df["implied_vol"].median() < 2:
     df["implied_vol_pct"] = df["implied_vol"] * 100
 else:
@@ -20961,9 +20819,9 @@ fig.show()
 
 ---
 
-## 19. How to Calculate Portfolio Alpha & Beta (Python + Interactive Brokers) (Lecture 128)
+## 19. How to Calculate Portfolio Alpha & Beta (Lecture 128)
 
-`2026 Video Lectures/128. How to Calculate Portfolio Alpha & Beta (Python + Interactive Brokers)/alpha_beta.ipynb` — Portfolio alpha and beta (Interactive Brokers).
+`2026 Video Lectures/128. How to Calculate Portfolio Alpha & Beta (Python + Interactive Brokers)/alpha_beta.ipynb` — Portfolio alpha and beta via CAPM regression on simulated data. (The notebook folder's IB-only get_portfolio_data.py is excluded.)
 
 ```python
 import numpy as np
