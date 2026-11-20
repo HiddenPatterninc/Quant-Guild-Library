@@ -2,6 +2,8 @@
 
 Code cells only (no outputs), in notebook order. Source paths are given for each.
 
+**Requirements:** `pip install numpy pandas scipy plotly matplotlib scikit-learn statsmodels yfinance ipywidgets qfin openpyxl ipython`. No Interactive Brokers account is needed. Lectures 47, 88, 100, 113, 119 and 138 originally read CSVs produced by IB scripts (or missing from the repo), so their sections now begin with a `yfinance` data-setup block that writes the same files.
+
 ## Index
 
 1. **How to Trade with the Black-Scholes Model (Lecture 6)** — Trade options against Black-Scholes model prices and simulate the equity curve.
@@ -540,7 +542,7 @@ vix_data["Mean"] = vix_data["Close"].mean()
 # Plot VIX data with mean
 plt.figure(figsize=(12, 6))
 plt.plot(vix_data["Close"], label="VIX Closing Prices")
-plt.axhline(vix_data["Close"].mean()[0], color="red", linestyle="--", label="Mean Level")
+plt.axhline(float(np.squeeze(vix_data["Close"].mean())), color="red", linestyle="--", label="Mean Level")
 plt.title("VIX Historical Data with Mean Reversion")
 plt.xlabel("Date")
 plt.ylabel("VIX Closing Price")
@@ -3701,6 +3703,34 @@ fig.show()
 ```python
 import numpy as np
 import pandas as pd
+import yfinance as yf  # replaces the Interactive Brokers (ibapi) data scripts
+
+
+def _yf_close(ticker, start, end=None):
+    """Daily adjusted close for one ticker from Yahoo Finance, as a Series indexed by date."""
+    raw = yf.download(ticker, start=start, end=end, auto_adjust=True, progress=False)
+    s = raw["Close"]
+    if isinstance(s, pd.DataFrame):
+        s = s.iloc[:, 0]
+    s = s.dropna()
+    s.index = pd.to_datetime(s.index).tz_localize(None)
+    s.name = ticker
+    return s
+
+
+# Writes spx_option_implied_realized_vol_10y.csv (columns: date, option_implied_volatility, realized_volatility)
+_px = _yf_close("^GSPC", "2015-06-01")
+_iv = _yf_close("^VIX", "2015-06-01") / 100.0          # VIX = 30-day implied vol proxy, in decimals
+_rv = np.log(_px).diff().rolling(21).std() * np.sqrt(252)  # 21-day realized vol, annualized
+_df = pd.concat([_iv.rename("option_implied_volatility"), _rv.rename("realized_volatility")], axis=1).dropna()
+_df = _df[_df.index >= _df.index.max() - pd.DateOffset(years=10)]
+_df.rename_axis("date").to_csv("spx_option_implied_realized_vol_10y.csv")
+
+```
+
+```python
+import numpy as np
+import pandas as pd
 import plotly.graph_objects as go
 
 # --- Load data ---
@@ -5791,6 +5821,31 @@ fig.show()
 ## 9. How to Protect your Stock Portfolio Against a Market Crash (Lecture 138)
 
 `2026 Video Lectures/138. How to Protect your Stock Portfolio Against a Market Crash/crash.ipynb` — Hedging a stock portfolio against a crash.
+
+```python
+import numpy as np
+import pandas as pd
+import yfinance as yf  # replaces the Interactive Brokers (ibapi) data scripts
+
+
+def _yf_close(ticker, start, end=None):
+    """Daily adjusted close for one ticker from Yahoo Finance, as a Series indexed by date."""
+    raw = yf.download(ticker, start=start, end=end, auto_adjust=True, progress=False)
+    s = raw["Close"]
+    if isinstance(s, pd.DataFrame):
+        s = s.iloc[:, 0]
+    s = s.dropna()
+    s.index = pd.to_datetime(s.index).tz_localize(None)
+    s.name = ticker
+    return s
+
+
+# Writes CAT_2025.csv, NVDA_2025.csv, SPY_2025.csv (columns: date, close)
+for _t in ["CAT", "NVDA", "SPY"]:
+    _s = _yf_close(_t, "2025-01-01", "2026-01-01")
+    _s.rename("close").rename_axis("date").reset_index().to_csv(f"{_t}_2025.csv", index=False)
+
+```
 
 ```python
 from pathlib import Path
@@ -8464,6 +8519,38 @@ fig.show()
 ## 10. Master Volatility with ARCH & GARCH Models (Lecture 47)
 
 `2025 Video Lectures/47. Master Volatility with ARCH & GARCH Models/arch_garch.ipynb` — ARCH/GARCH volatility fitting and forecasting.
+
+```python
+import numpy as np
+import pandas as pd
+import yfinance as yf  # replaces the Interactive Brokers (ibapi) data scripts
+
+
+def _yf_close(ticker, start, end=None):
+    """Daily adjusted close for one ticker from Yahoo Finance, as a Series indexed by date."""
+    raw = yf.download(ticker, start=start, end=end, auto_adjust=True, progress=False)
+    s = raw["Close"]
+    if isinstance(s, pd.DataFrame):
+        s = s.iloc[:, 0]
+    s = s.dropna()
+    s.index = pd.to_datetime(s.index).tz_localize(None)
+    s.name = ticker
+    return s
+
+
+# Writes aapl_volatility_data_2023.csv and aapl_volatility_data_2023_2025.csv
+# columns: date, close, returns, ib_realized_vol_30d (name kept for the notebook), implied_vol
+_px = _yf_close("AAPL", "2022-10-01", "2026-01-01")
+_iv = _yf_close("^VXAPL", "2022-10-01", "2026-01-01") / 100.0   # CBOE Apple VIX = implied-vol proxy
+_d = pd.DataFrame({"close": _px})
+_d["returns"] = np.log(_d["close"] / _d["close"].shift(1))
+_d["ib_realized_vol_30d"] = _d["returns"].rolling(30).std() * np.sqrt(252)
+_d = _d.join(_iv.rename("implied_vol"), how="left")
+for _name, _a, _b in [("aapl_volatility_data_2023.csv", "2023-01-01", "2023-12-31"),
+                      ("aapl_volatility_data_2023_2025.csv", "2023-01-01", "2025-12-31")]:
+    _d.loc[_a:_b].rename_axis("date").reset_index().to_csv(_name, index=False)
+
+```
 
 ```python
 %%html
@@ -16535,6 +16622,34 @@ plt.show()
 `2026 Video Lectures/100. Black-Litterman vs. Mean-Variance Portfolio Optimization in Python/blmpfm.ipynb` — Black-Litterman vs mean-variance optimization.
 
 ```python
+import numpy as np
+import pandas as pd
+import yfinance as yf  # replaces the Interactive Brokers (ibapi) data scripts
+
+
+def _yf_close(ticker, start, end=None):
+    """Daily adjusted close for one ticker from Yahoo Finance, as a Series indexed by date."""
+    raw = yf.download(ticker, start=start, end=end, auto_adjust=True, progress=False)
+    s = raw["Close"]
+    if isinstance(s, pd.DataFrame):
+        s = s.iloc[:, 0]
+    s = s.dropna()
+    s.index = pd.to_datetime(s.index).tz_localize(None)
+    s.name = ticker
+    return s
+
+
+# Writes efficient_frontier_daily_returns.csv (columns: date, symbol, daily_return) for 99 S&P 500 stocks
+_syms = ['GOOGL', 'META', 'DIS', 'NFLX', 'CMCSA', 'T', 'VZ', 'TMUS', 'CHTR', 'AMZN', 'TSLA', 'HD', 'MCD', 'NKE', 'SBUX', 'LOW', 'TJX', 'BKNG', 'PG', 'KO', 'PEP', 'WMT', 'COST', 'MDLZ', 'MO', 'PM', 'CL', 'XOM', 'CVX', 'COP', 'SLB', 'EOG', 'MPC', 'PSX', 'VLO', 'OXY', 'JPM', 'BAC', 'WFC', 'GS', 'MS', 'BLK', 'SCHW', 'AXP', 'C', 'JNJ', 'UNH', 'LLY', 'ABBV', 'MRK', 'PFE', 'TMO', 'DHR', 'BMY', 'CAT', 'DE', 'UPS', 'HON', 'RTX', 'LMT', 'GE', 'MMM', 'BA', 'AAPL', 'MSFT', 'NVDA', 'AVGO', 'CRM', 'AMD', 'ORCL', 'ADBE', 'CSCO', 'LIN', 'APD', 'SHW', 'ECL', 'NEM', 'FCX', 'DD', 'DOW', 'NUE', 'PLD', 'AMT', 'EQIX', 'SPG', 'PSA', 'WELL', 'DLR', 'O', 'VICI', 'NEE', 'DUK', 'SO', 'D', 'AEP', 'SRE', 'EXC', 'XEL', 'ED']
+_px = yf.download(_syms, start="2024-06-01", auto_adjust=True, progress=False)["Close"]
+_px.index = pd.to_datetime(_px.index).tz_localize(None)
+_ret = _px.pct_change().iloc[1:].dropna(how="all")
+_long = _ret.stack().rename("daily_return").rename_axis(["date", "symbol"]).reset_index()
+_long.to_csv("efficient_frontier_daily_returns.csv", index=False)
+
+```
+
+```python
 %%html
 <style>
 /* Overwrite the hard-coded white background for ipywidgets */
@@ -18382,6 +18497,30 @@ fig.show()
 ## 19. How a Quant Manages a Portfolio (Lecture 88)
 
 `2026 Video Lectures/88. How a Quant Manages a Portfolio/ff.ipynb` — Factor-model portfolio management.
+
+```python
+import numpy as np
+import pandas as pd
+import yfinance as yf  # replaces the Interactive Brokers (ibapi) data scripts
+
+
+def _yf_close(ticker, start, end=None):
+    """Daily adjusted close for one ticker from Yahoo Finance, as a Series indexed by date."""
+    raw = yf.download(ticker, start=start, end=end, auto_adjust=True, progress=False)
+    s = raw["Close"]
+    if isinstance(s, pd.DataFrame):
+        s = s.iloc[:, 0]
+    s = s.dropna()
+    s.index = pd.to_datetime(s.index).tz_localize(None)
+    s.name = ticker
+    return s
+
+
+# Writes one <TICKER>.csv per symbol (columns: date, close) from 2023 onward
+for _t in ["AAPL", "MSFT", "AVGO", "UNH", "JNJ", "AMGN", "WMT", "COST", "PG", "SPY"]:
+    _yf_close(_t, "2023-01-01").rename("close").rename_axis("date").reset_index().to_csv(f"{_t}.csv", index=False)
+
+```
 
 ```python
 %%html
