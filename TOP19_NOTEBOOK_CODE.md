@@ -1,4 +1,4 @@
-# Top 18 Notebooks for a Strategy / Trading Engine
+# Top 19 Notebooks for a Strategy / Trading Engine
 
 Code cells only (no outputs), in notebook order. Source paths are given for each.
 
@@ -20,8 +20,9 @@ Code cells only (no outputs), in notebook order. Source paths are given for each
 14. **Trading with the Black-Scholes Implied Volatility Surface (Lecture 30)** — Build and explore the implied volatility surface.
 15. **How to Price Options with Monte Carlo Simulation (Lecture 73)** — Price options with Monte Carlo simulation.
 16. **How to Trade with the Kelly Criterion (Lecture 36)** — Kelly criterion bet sizing.
-17. **Black-Litterman vs. Mean-Variance Portfolio Optimization in Python (Lecture 100)** — Black-Litterman vs mean-variance optimization.
-18. **How a Quant Manages a Portfolio (Lecture 88)** — Factor-model portfolio management.
+17. **Analyzing Stock Returns with Principal Component Analysis in Python (Lecture 17)** — PCA of stock returns (SVD and covariance eigendecomposition) for risk factors and decorrelation.
+18. **Black-Litterman vs. Mean-Variance Portfolio Optimization in Python (Lecture 100)** — Black-Litterman vs mean-variance optimization.
+19. **How a Quant Manages a Portfolio (Lecture 88)** — Factor-model portfolio management.
 
 ---
 
@@ -16344,7 +16345,192 @@ print(f"Incorrect Estimation: {np.sum(paths_incorrect[:, -1] > initial_capital) 
 
 ---
 
-## 17. Black-Litterman vs. Mean-Variance Portfolio Optimization in Python (Lecture 100)
+## 17. Analyzing Stock Returns with Principal Component Analysis in Python (Lecture 17)
+
+`2025 Video Lectures/17. Analyzing Stock Returns with Principal Component Analysis in Python/PCA-Stock-Returns-main/PCA-Stock-Returns-main/pca_stock_returns_analysis.ipynb` — PCA of stock returns (SVD and covariance eigendecomposition) for risk factors and decorrelation.
+
+```python
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+from sklearn.preprocessing import StandardScaler
+from sklearn.decomposition import PCA
+from scipy import stats
+```
+
+```python
+# Load all sheets from the Excel file
+excel_file = pd.ExcelFile('stock_returns_2021_2022.xlsx')
+sheet_names = excel_file.sheet_names
+
+# Initialize empty list to store dataframes
+dfs = []
+
+# Read each sheet and add to list
+for sheet in sheet_names:
+    df_sheet = pd.read_excel(excel_file, sheet_name=sheet)
+    df_sheet['Stock'] = sheet  # Add column to identify stock
+    dfs.append(df_sheet)
+
+# Concatenate all dataframes
+df = pd.concat(dfs, ignore_index=True)
+
+# Group by date and pivot to get stocks as columns
+df = df.pivot_table(
+    index='Date',
+    columns='Stock', 
+    values='Close',
+    aggfunc='first'
+).reset_index()
+
+# Sort by date in ascending order to ensure proper return calculation
+df = df.sort_values('Date')
+
+# Calculate log returns for each stock column (excluding Date)
+stock_columns = df.columns.difference(['Date'])
+# Using shift(1) since data is in ascending order - newer minus older prices
+df[stock_columns] = np.log(df[stock_columns] / df[stock_columns].shift(1))
+
+# Drop first row since it will have NaN values after calculating returns
+df = df.dropna()
+
+# Display basic information about the dataset
+print("Dataset Shape:", df.shape)
+print("\nFirst few rows:")
+display(df.head())
+
+# Check for missing values
+print("\nMissing values:")
+display(df.isnull().sum())
+```
+
+```python
+# Calculate correlation matrix excluding the Date column
+correlation_matrix = df.drop('Date', axis=1).corr()
+
+# Plot correlation heatmap
+plt.figure(figsize=(12, 10))
+im = plt.imshow(correlation_matrix, cmap='coolwarm', aspect='auto', vmin=-1, vmax=1)
+plt.colorbar(im)
+
+# Add correlation values as text annotations
+for i in range(len(correlation_matrix)):
+    for j in range(len(correlation_matrix)):
+        text = plt.text(j, i, f'{correlation_matrix.iloc[i, j]:.2f}',
+                       ha='center', va='center')
+
+# Set ticks and labels
+plt.xticks(range(len(correlation_matrix)), correlation_matrix.columns, rotation=45)
+plt.yticks(range(len(correlation_matrix)), correlation_matrix.columns)
+
+plt.title('Correlation Matrix of Stock Returns')
+plt.tight_layout()
+plt.show()
+
+# Calculate average correlation
+avg_correlation = (correlation_matrix.sum().sum() - len(correlation_matrix)) / (len(correlation_matrix) * (len(correlation_matrix) - 1))
+print(f"Average correlation between stocks: {avg_correlation:.3f}")
+```
+
+```python
+# Remove SPX from the data and drop the Date column
+df_no_spx = df.drop(['SPX 2021_2022', 'Date'], axis=1)
+
+# Standardize the data
+scaler = StandardScaler()
+returns_scaled = scaler.fit_transform(df_no_spx)
+
+# Apply PCA
+pca = PCA()
+pca_result = pca.fit_transform(returns_scaled)
+
+# Create DataFrame with principal components
+pca_df = pd.DataFrame(
+    pca_result,
+    columns=[f'PC{i+1}' for i in range(len(df_no_spx.columns))]
+)
+
+# Plot explained variance ratio
+plt.figure(figsize=(10, 6))
+plt.plot(range(1, len(pca.explained_variance_ratio_) + 1),
+         np.cumsum(pca.explained_variance_ratio_), 'bo-')
+plt.xlabel('Number of Components')
+plt.ylabel('Cumulative Explained Variance Ratio')
+plt.title('Scree Plot: Cumulative Explained Variance (excluding SPX)')
+plt.grid(True)
+plt.show()
+
+# Print explained variance for first 3 components
+print("Explained variance ratio for first 3 components (excluding SPX):")
+for i, ratio in enumerate(pca.explained_variance_ratio_[:3]):
+    print(f"PC{i+1}: {ratio:.3f}")
+```
+
+```python
+# Get component loadings
+loadings = pd.DataFrame(
+    pca.components_.T,
+    columns=[f'PC{i+1}' for i in range(len(df_no_spx.columns))],
+    index=df_no_spx.columns
+)
+
+# Plot loadings for first 3 PCs on a single plot
+plt.figure(figsize=(12, 8))
+for i in range(3):
+    plt.plot(loadings.index, loadings[f'PC{i+1}'], 
+             marker='o', 
+             linewidth=2, 
+             markersize=8,
+             label=f'PC{i+1}')
+
+plt.title('Component Loadings for First 3 Principal Components')
+plt.xlabel('Stocks')
+plt.ylabel('Loading Value')
+plt.grid(True)
+plt.legend()
+plt.xticks(rotation=45)
+plt.tight_layout()
+plt.show()
+
+# Print top contributors for each PC
+print("Top contributors to each principal component:")
+for i in range(3):
+    print(f"\nPC{i+1}:")
+    top_contributors = loadings[f'PC{i+1}'].abs().sort_values(ascending=False).head(3)
+    for stock, loading in top_contributors.items():
+        print(f"{stock}: {loading:.3f}")
+```
+
+```python
+# Calculate rolling PCA (using 60-day windows)
+window_size = 60
+rolling_pca = []
+
+for i in range(window_size, len(df_no_spx)):
+    window_data = df_no_spx.iloc[i-window_size:i]
+    window_scaled = StandardScaler().fit_transform(window_data)
+    pca_window = PCA()
+    pca_window.fit(window_scaled)
+    rolling_pca.append(pca_window.explained_variance_ratio_[:3])
+
+rolling_pca_df = pd.DataFrame(rolling_pca, columns=['PC1', 'PC2', 'PC3'])
+
+# Plot rolling explained variance
+plt.figure(figsize=(12, 6))
+for col in rolling_pca_df.columns:
+    plt.plot(rolling_pca_df.index, rolling_pca_df[col], label=col)
+plt.xlabel('Time')
+plt.ylabel('Explained Variance Ratio')
+plt.title('Rolling Explained Variance Ratio (60-day window)')
+plt.legend()
+plt.grid(True)
+plt.show()
+```
+
+
+---
+
+## 18. Black-Litterman vs. Mean-Variance Portfolio Optimization in Python (Lecture 100)
 
 `2026 Video Lectures/100. Black-Litterman vs. Mean-Variance Portfolio Optimization in Python/blmpfm.ipynb` — Black-Litterman vs mean-variance optimization.
 
@@ -18193,7 +18379,7 @@ fig.show()
 
 ---
 
-## 18. How a Quant Manages a Portfolio (Lecture 88)
+## 19. How a Quant Manages a Portfolio (Lecture 88)
 
 `2026 Video Lectures/88. How a Quant Manages a Portfolio/ff.ipynb` — Factor-model portfolio management.
 
