@@ -1,6 +1,6 @@
 # Trading Engine
 
-Code cells only (no outputs), in notebook order. Source paths are given for each. Sections 20–25 add a Hyperliquid pairs-trading engine: a design spec, four Python modules and a runner. Save each module in one folder under the file name shown (they import each other), then run `python run_trading_engine.py` to scan, backtest and paper-trade. Paper mode places no orders.
+Code cells only (no outputs), in notebook order. Source paths are given for each. Sections 20–26 add a Hyperliquid pairs-trading engine: a design spec, four Python modules, a runner and charts. Save each module in one folder under the file name shown (they import each other), then run `python run_trading_engine.py` to scan, backtest and paper-trade (paper mode places no orders), or `python hyperliquid_engine_charts.py` for example charts.
 
 **Requirements:** `pip install numpy pandas scipy plotly matplotlib scikit-learn statsmodels yfinance ipywidgets qfin openpyxl ipython requests`. Live trading in section 24 also needs `pip install hyperliquid-python-sdk eth-account` (paper mode does not). No Interactive Brokers account is needed. Lectures 47, 88, 100, 113, 119 and 138 originally read CSVs produced by IB scripts (or missing from the repo), so their sections now begin with a `yfinance` data-setup block that writes the same files.
 
@@ -31,6 +31,7 @@ Code cells only (no outputs), in notebook order. Source paths are given for each
 23. **Hyperliquid Pairs Backtester (`hyperliquid_pairs_backtester.py`)** — Walk-forward backtester with maker/taker fees, hourly funding PnL and Sharpe/Sortino/drawdown metrics; validates scanner output.
 24. **Hyperliquid Execution Controller (`hyperliquid_execution_controller.py`)** — Two-leg order execution: post-only limit on the less liquid leg, then an IOC hedge on the liquid leg; paper mode by default.
 25. **End-to-End Runner (`run_trading_engine.py`)** — Wires sections 21–24 together: scan, backtest, keep validated pairs, then poll signals and paper-trade entries and exits.
+26. **Engine Charts (`hyperliquid_engine_charts.py`)** — Interactive plotly charts: backtest dashboard (equity, drawdown, z-score with trade markers, hedge ratio), per-trade PnL, pair prices and spread, scanner results and validation summary; `chart_pair_backtest()` fetches Hyperliquid data and charts one pair.
 
 ---
 
@@ -24279,4 +24280,461 @@ def main(max_cycles: int | None = None) -> None:
 
 if __name__ == "__main__":
     main()
+```
+
+---
+
+## 26. Engine Charts (`hyperliquid_engine_charts.py`)
+
+Interactive plotly charts: backtest dashboard (equity, drawdown, z-score with trade markers, hedge ratio), per-trade PnL, pair prices and spread, scanner results and validation summary; `chart_pair_backtest()` fetches Hyperliquid data and charts one pair.
+
+Save as `hyperliquid_engine_charts.py`. Running it directly writes example charts from simulated data to a `charts/` folder; for real data call `chart_pair_backtest("SUI", "SOL")` and `.show()` the figures.
+
+```python
+"""
+Hyperliquid Pairs Engine: Charts
+--------------------------------
+Interactive plotly charts for the pairs-trading engine:
+  * plot_backtest_dashboard  - equity, drawdown, z-score with trade markers, hedge ratio
+  * plot_trade_pnl           - per-trade net PnL with gross / fees / funding breakdown
+  * plot_pair_prices         - both legs rebased to 100, plus the hedged spread
+  * plot_scanner_pairs       - scanner results: half-life vs ADF p-value
+  * plot_validation_summary  - backtest validation results for many pairs
+  * chart_pair_backtest      - fetch Hyperliquid data, backtest one pair, return all charts
+
+Figures open in a browser / Jupyter with fig.show(), or save with save_figure(fig, "x.html").
+
+    pip install plotly
+"""
+
+from __future__ import annotations
+
+import os
+from dataclasses import asdict
+from datetime import datetime, timezone
+from typing import Dict, List, Optional, Sequence, Tuple
+
+import numpy as np
+import pandas as pd
+import plotly.graph_objects as go
+from plotly.subplots import make_subplots
+
+from pairs_strategy_engine import (
+    HorizonConfig,
+    HorizonMode,
+    HyperliquidDataClient,
+    KalmanPairsFilter,
+    PairConfig,
+    classify_asset,
+    pair_bucket,
+)
+from hyperliquid_pair_scanner import DiscoveredPair
+from hyperliquid_pairs_backtester import (
+    BacktestConfig,
+    HyperliquidPairsBacktester,
+    PairBacktestMetrics,
+    SimulatedTrade,
+    fetch_historical_funding_series,
+)
+
+TEMPLATE = "plotly_dark"
+COLORS = {
+    "equity": "#4cc9f0",
+    "drawdown": "#ef476f",
+    "z": "#e0e0e0",
+    "beta": "#ffd166",
+    "entry_band": "#f8961e",
+    "stop_band": "#ef476f",
+    "exit_line": "#8d99ae",
+    "long": "#06d6a0",
+    "short": "#ef476f",
+    "win": "#06d6a0",
+    "loss": "#ef476f",
+    "leg_y": "#4cc9f0",
+    "leg_x": "#f8961e",
+    "spread": "#b388ff",
+}
+EXIT_COLORS = {
+    "MEAN_REVERSION": "#06d6a0",
+    "STOP_LOSS": "#ef476f",
+    "REGIME_BREAK": "#f8961e",
+    "EOD_CLOSE": "#8d99ae",
+    "END_OF_DATA": "#adb5bd",
+}
+BUCKET_COLORS = {
+    "CRYPTO_INTRA": "#4cc9f0",
+    "STOCK_INTRA": "#06d6a0",
+    "COMMODITY_INTRA": "#ffd166",
+    "CROSS_ASSET_MACRO": "#b388ff",
+}
+
+
+def _style(fig: go.Figure, title: str, height: int) -> go.Figure:
+    top, bottom = 90, 100
+    legend_y = -55.0 / max(height - top - bottom, 100)  # ~55px below the plot, clear of tick labels
+    fig.update_layout(
+        template=TEMPLATE,
+        title=dict(text=title, x=0.01, xanchor="left"),
+        height=height,
+        hovermode="x unified",
+        legend=dict(orientation="h", yanchor="top", y=legend_y, xanchor="left", x=0),
+        margin=dict(l=60, r=110, t=top, b=bottom),
+    )
+    fig.update_xaxes(showgrid=True, gridcolor="rgba(255,255,255,0.08)")
+    fig.update_yaxes(showgrid=True, gridcolor="rgba(255,255,255,0.08)", zeroline=False)
+    return fig
+
+
+def save_figure(fig: go.Figure, path: str) -> str:
+    """Saves a figure as a standalone interactive HTML file and returns the path."""
+    folder = os.path.dirname(path)
+    if folder:
+        os.makedirs(folder, exist_ok=True)
+    fig.write_html(path, include_plotlyjs=True)
+    return path
+
+
+# ---------------------------------------------------------------------------
+# 1. Backtest dashboard
+# ---------------------------------------------------------------------------
+
+def plot_backtest_dashboard(
+    equity_curve: pd.DataFrame,
+    trades: Sequence[SimulatedTrade],
+    pair: PairConfig,
+    metrics: Optional[PairBacktestMetrics] = None,
+    warmup_bars: int = 0,
+) -> go.Figure:
+    """
+    Four stacked panels sharing the time axis:
+      1. Equity curve (USDC), with each trade's holding period shaded
+      2. Drawdown from the running peak (%)
+      3. Kalman z-score with entry / exit / stop thresholds and trade markers
+      4. Kalman hedge ratio beta_t
+    equity_curve and trades are the 2nd and 3rd values returned by run_backtest().
+    """
+    hp = HorizonConfig.for_horizon(pair.horizon)
+    eq = equity_curve.copy()
+    active = eq.iloc[warmup_bars:] if warmup_bars else eq
+    drawdown = (active["equity"] / active["equity"].cummax() - 1.0) * 100.0
+
+    fig = make_subplots(
+        rows=4, cols=1, shared_xaxes=True, vertical_spacing=0.035,
+        row_heights=[0.36, 0.14, 0.32, 0.18],
+        subplot_titles=("Equity (USDC)", "Drawdown (%)", "Z-score and trades", "Hedge ratio β (units of X per unit of Y)"),
+    )
+
+    # 1. Equity
+    fig.add_trace(go.Scatter(x=eq.index, y=eq["equity"], name="Equity",
+                             line=dict(color=COLORS["equity"], width=2)), row=1, col=1)
+    for t in trades:
+        fig.add_vrect(x0=t.entry_time, x1=t.exit_time, row=1, col=1, line_width=0, layer="below",
+                      fillcolor=COLORS["long"] if t.direction == "LONG_SPREAD" else COLORS["short"],
+                      opacity=0.12)
+
+    # 2. Drawdown
+    fig.add_trace(go.Scatter(x=drawdown.index, y=drawdown, name="Drawdown", fill="tozeroy",
+                             line=dict(color=COLORS["drawdown"], width=1),
+                             fillcolor="rgba(239,71,111,0.25)"), row=2, col=1)
+
+    # 3. Z-score with thresholds
+    if warmup_bars:
+        z = eq["z_score"].where(np.arange(len(eq)) >= warmup_bars)  # hide unstable warm-up values
+    else:
+        z = eq["z_score"]
+    fig.add_trace(go.Scatter(x=eq.index, y=z, name="Z-score",
+                             line=dict(color=COLORS["z"], width=1)), row=3, col=1)
+    for level, color, dash, label in [
+        (hp.entry_z, COLORS["entry_band"], "dash", f"entry ±{hp.entry_z}"),
+        (-hp.entry_z, COLORS["entry_band"], "dash", None),
+        (hp.stop_z, COLORS["stop_band"], "dot", f"stop ±{hp.stop_z}"),
+        (-hp.stop_z, COLORS["stop_band"], "dot", None),
+        (hp.exit_z, COLORS["exit_line"], "solid", f"exit {hp.exit_z}"),
+    ]:
+        label_kw = dict(annotation_text=label, annotation_position="right",
+                        annotation_font=dict(color=color, size=10)) if label else {}
+        fig.add_hline(y=level, line=dict(color=color, dash=dash, width=1), row=3, col=1, **label_kw)
+
+    longs = [t for t in trades if t.direction == "LONG_SPREAD"]
+    shorts = [t for t in trades if t.direction == "SHORT_SPREAD"]
+    for group, name, symbol, color in [(longs, "Long spread entry", "triangle-up", COLORS["long"]),
+                                       (shorts, "Short spread entry", "triangle-down", COLORS["short"])]:
+        if group:
+            fig.add_trace(go.Scatter(
+                x=[t.entry_time for t in group], y=[t.entry_z for t in group], mode="markers", name=name,
+                marker=dict(symbol=symbol, size=12, color=color, line=dict(color="white", width=1)),
+                customdata=[[t.trade_id, t.entry_beta, t.notional_y, t.notional_x] for t in group],
+                hovertemplate="Trade %{customdata[0]}<br>z=%{y:.2f}<br>β=%{customdata[1]:.4f}"
+                              "<br>Y $%{customdata[2]:,.0f} / X $%{customdata[3]:,.0f}<extra></extra>",
+            ), row=3, col=1)
+    reasons = sorted({t.exit_reason for t in trades})
+    for reason in reasons:
+        group = [t for t in trades if t.exit_reason == reason]
+        fig.add_trace(go.Scatter(
+            x=[t.exit_time for t in group], y=[t.exit_z for t in group], mode="markers",
+            name=f"Exit: {reason.replace('_', ' ').lower()}",
+            marker=dict(symbol="x", size=10, color=EXIT_COLORS.get(reason, "#ffffff")),
+            customdata=[[t.trade_id, t.net_pnl, t.bars_held] for t in group],
+            hovertemplate="Trade %{customdata[0]} exit<br>z=%{y:.2f}<br>net $%{customdata[1]:,.2f}"
+                          "<br>held %{customdata[2]} bars<extra></extra>",
+        ), row=3, col=1)
+
+    # 4. Hedge ratio
+    beta = eq["beta"].where(np.arange(len(eq)) >= warmup_bars) if warmup_bars else eq["beta"]
+    fig.add_trace(go.Scatter(x=eq.index, y=beta, name="β",
+                             line=dict(color=COLORS["beta"], width=1.5)), row=4, col=1)
+
+    z_lim = max(hp.stop_z + 0.5, float(np.nanmax(np.abs(z.to_numpy()))) if len(z.dropna()) else 0)
+    fig.update_yaxes(range=[-z_lim, z_lim], row=3, col=1)
+
+    title = f"{pair.leg_y} / {pair.leg_x} · {HorizonMode(pair.horizon).value} backtest"
+    if metrics is not None:
+        title += (f"<br><sup>Net ${metrics.net_pnl_usdc:,.2f} · Sharpe {metrics.sharpe_ratio:.2f} · "
+                  f"Max DD {metrics.max_drawdown_pct:.2f}% · {metrics.total_trades} trades · "
+                  f"win rate {metrics.win_rate_pct:.0f}% · "
+                  f"{'PASSED' if metrics.passed_validation else 'FAILED'} validation</sup>")
+    return _style(fig, title, height=950)
+
+
+# ---------------------------------------------------------------------------
+# 2. Per-trade PnL
+# ---------------------------------------------------------------------------
+
+def plot_trade_pnl(trades: Sequence[SimulatedTrade], title: str = "Trade PnL breakdown") -> go.Figure:
+    """
+    One group of bars per trade: gross spread PnL, fees (negative) and funding, with the
+    net result as a marker and the cumulative net PnL as a line on the right axis.
+    """
+    fig = make_subplots(specs=[[{"secondary_y": True}]])
+    if not trades:
+        fig.add_annotation(text="No trades", showarrow=False, font=dict(size=16))
+        return _style(fig, title, height=450)
+
+    labels = [f"#{t.trade_id} {'L' if t.direction == 'LONG_SPREAD' else 'S'}" for t in trades]
+    hover = [[t.direction, t.exit_reason, t.bars_held, t.entry_time.strftime("%Y-%m-%d %H:%M")] for t in trades]
+    for name, values, color in [
+        ("Gross", [t.gross_pnl for t in trades], "rgba(76,201,240,0.75)"),
+        ("Fees", [-t.fees_paid for t in trades], "rgba(239,71,111,0.75)"),
+        ("Funding", [t.funding_pnl for t in trades], "rgba(255,209,102,0.75)"),
+    ]:
+        fig.add_trace(go.Bar(x=labels, y=values, name=name, marker_color=color, customdata=hover,
+                             hovertemplate=f"{name}: $%{{y:,.2f}}<extra></extra>"), secondary_y=False)
+    net = [t.net_pnl for t in trades]
+    fig.add_trace(go.Scatter(
+        x=labels, y=net, mode="markers", name="Net",
+        marker=dict(size=11, symbol="diamond", line=dict(color="white", width=1),
+                    color=[COLORS["win"] if v > 0 else COLORS["loss"] for v in net]),
+        customdata=hover,
+        hovertemplate="Net: $%{y:,.2f}<br>%{customdata[0]} · exit %{customdata[1]}"
+                      "<br>held %{customdata[2]} bars · opened %{customdata[3]}<extra></extra>",
+    ), secondary_y=False)
+    cumulative = np.cumsum(net)
+    fig.add_trace(go.Scatter(x=labels, y=cumulative, mode="lines+markers", name="Cumulative net",
+                             line=dict(color="white", width=2, dash="dot")), secondary_y=True)
+
+    # Line up zero on both axes so the cumulative line is read against the right baseline
+    pos = [max(t.gross_pnl, 0) + max(t.funding_pnl, 0) for t in trades] + [max(v, 0) for v in net]
+    neg = [min(t.gross_pnl, 0) + min(t.funding_pnl, 0) - t.fees_paid for t in trades] + [min(v, 0) for v in net]
+    p_hi, p_lo = max(pos + [1e-9]) * 1.1, min(neg + [0.0]) * 1.1
+    s_hi, s_lo = max(float(cumulative.max()), 1e-9) * 1.1, min(float(cumulative.min()), 0.0) * 1.1
+    frac = max(-p_lo / (p_hi - p_lo), -s_lo / (s_hi - s_lo))  # share of each axis below zero
+    p_lo, s_lo = -frac * p_hi / (1 - frac), -frac * s_hi / (1 - frac)
+
+    fig.update_layout(barmode="relative")
+    fig.update_yaxes(title_text="Per-trade USDC", range=[p_lo, p_hi], secondary_y=False)
+    fig.update_yaxes(title_text="Cumulative USDC", range=[s_lo, s_hi], secondary_y=True, showgrid=False)
+    return _style(fig, title, height=480)
+
+
+# ---------------------------------------------------------------------------
+# 3. Pair prices and hedged spread
+# ---------------------------------------------------------------------------
+
+def plot_pair_prices(
+    df_y: pd.DataFrame,
+    df_x: pd.DataFrame,
+    leg_y: str,
+    leg_x: str,
+    horizon: HorizonMode = HorizonMode.MULTIDAY,
+) -> go.Figure:
+    """
+    Top: both legs rebased to 100 at the first common bar.
+    Bottom: the hedged spread Y - beta_t * X - alpha_t, using the Kalman hedge ratio
+    known at each bar (no look-ahead).
+    df_y / df_x are candle DataFrames from HyperliquidDataClient.get_candles().
+    """
+    hp = HorizonConfig.for_horizon(horizon)
+    aligned = pd.concat([df_y["close"].rename("y"), df_x["close"].rename("x")], axis=1, join="inner").dropna()
+    kf = KalmanPairsFilter(delta=hp.kalman_delta, obs_variance=hp.obs_noise_r)
+    states = [kf.update(float(a), float(b)) for a, b in zip(aligned["y"], aligned["x"])]
+    spread = np.array([s.spread for s in states])
+
+    fig = make_subplots(rows=2, cols=1, shared_xaxes=True, vertical_spacing=0.06, row_heights=[0.6, 0.4],
+                        subplot_titles=("Prices rebased to 100", "Kalman spread (Leg Y price units)"))
+    for col, name, color in [("y", leg_y, COLORS["leg_y"]), ("x", leg_x, COLORS["leg_x"])]:
+        rebased = aligned[col] / aligned[col].iloc[0] * 100.0
+        fig.add_trace(go.Scatter(x=aligned.index, y=rebased, name=name, line=dict(color=color, width=1.5)),
+                      row=1, col=1)
+    fig.add_trace(go.Scatter(x=aligned.index, y=spread, name="Spread",
+                             line=dict(color=COLORS["spread"], width=1)), row=2, col=1)
+    fig.add_hline(y=0, line=dict(color=COLORS["exit_line"], width=1), row=2, col=1)
+    return _style(fig, f"{leg_y} vs {leg_x}", height=600)
+
+
+# ---------------------------------------------------------------------------
+# 4. Scanner results
+# ---------------------------------------------------------------------------
+
+def plot_scanner_pairs(
+    pairs: Sequence[DiscoveredPair],
+    horizon: HorizonMode = HorizonMode.MULTIDAY,
+    adf_threshold: float = 0.05,
+) -> go.Figure:
+    """
+    One bubble per discovered pair: x = OU half-life (hours), y = ADF p-value (lower is
+    more stationary), bubble size = Leg Y 24h volume, colour = asset bucket.
+    Dashed lines show the half-life window and ADF threshold the scanner applied.
+    """
+    hp = HorizonConfig.for_horizon(horizon)
+    fig = go.Figure()
+    if not pairs:
+        fig.add_annotation(text="Scanner found no pairs", showarrow=False, font=dict(size=16))
+        return _style(fig, "Scanner results", height=500)
+
+    max_vol = max(p.volume_24h_y for p in pairs) or 1.0
+    for bucket in sorted({p.bucket for p in pairs}):
+        group = [p for p in pairs if p.bucket == bucket]
+        fig.add_trace(go.Scatter(
+            x=[p.half_life_hours for p in group], y=[p.adf_pvalue for p in group], mode="markers+text",
+            name=bucket.replace("_", " ").title(), text=[f"{p.leg_y}/{p.leg_x}" for p in group],
+            textposition="top center", textfont=dict(size=10),
+            marker=dict(size=[12 + 30 * np.sqrt(p.volume_24h_y / max_vol) for p in group],
+                        color=BUCKET_COLORS.get(bucket, "#ffffff"), opacity=0.8,
+                        line=dict(color="white", width=1)),
+            customdata=[[p.corr_24h, p.current_zscore, p.hedge_ratio_ols, p.volume_24h_y] for p in group],
+            hovertemplate="<b>%{text}</b><br>half-life %{x:.1f}h · ADF p %{y:.4f}"
+                          "<br>24h corr %{customdata[0]:.2f} · z %{customdata[1]:+.2f}"
+                          "<br>OLS hedge %{customdata[2]:.4f} · Y vol $%{customdata[3]:,.0f}<extra></extra>",
+        ))
+    lo_h, hi_h = hp.min_half_life_mins / 60.0, hp.max_half_life_mins / 60.0
+    fig.add_vline(x=lo_h, line=dict(color=COLORS["exit_line"], dash="dash", width=1))
+    fig.add_vline(x=hi_h, line=dict(color=COLORS["exit_line"], dash="dash", width=1))
+    fig.add_hline(y=adf_threshold, line=dict(color=COLORS["stop_band"], dash="dash", width=1),
+                  annotation_text=f"ADF p = {adf_threshold}", annotation_position="top right")
+    fig.update_xaxes(title_text="OU half-life (hours)")
+    fig.update_yaxes(title_text="ADF p-value", rangemode="tozero")
+    fig.update_layout(hovermode="closest")
+    return _style(fig, f"Scanner results · {HorizonMode(horizon).value} "
+                       f"(half-life window {lo_h:g}–{hi_h:g}h)", height=550)
+
+
+# ---------------------------------------------------------------------------
+# 5. Validation summary
+# ---------------------------------------------------------------------------
+
+def plot_validation_summary(summary: pd.DataFrame) -> go.Figure:
+    """
+    Horizontal bars of net PnL and Sharpe ratio per pair, coloured by whether the pair
+    passed backtest validation. `summary` is the DataFrame from validate_discovered_pairs().
+    """
+    fig = make_subplots(rows=1, cols=2, shared_yaxes=True, horizontal_spacing=0.04,
+                        subplot_titles=("Net PnL (USDC)", "Sharpe ratio"))
+    if summary.empty:
+        fig.add_annotation(text="No backtest results", showarrow=False, font=dict(size=16))
+        return _style(fig, "Backtest validation", height=400)
+
+    df = summary.sort_values("net_pnl_usdc")
+    colors = [COLORS["win"] if ok else COLORS["loss"] for ok in df["passed_validation"]]
+    reasons = ["passed" if ok else "; ".join(r) for ok, r in zip(df["passed_validation"], df["rejection_reasons"])]
+    common = dict(y=df["pair_label"], orientation="h", marker_color=colors, customdata=np.column_stack(
+        [df["total_trades"], df["max_drawdown_pct"], reasons]), showlegend=False)
+    fig.add_trace(go.Bar(x=df["net_pnl_usdc"], text=[f"{n} trades" for n in df["total_trades"]],
+                         textposition="outside", cliponaxis=False,
+                         hovertemplate="%{y}: $%{x:,.2f}<br>%{customdata[0]} trades · "
+                         "max DD %{customdata[1]}%<br>%{customdata[2]}<extra></extra>", **common), row=1, col=1)
+    fig.add_trace(go.Bar(x=df["sharpe_ratio"], hovertemplate="%{y}: Sharpe %{x:.2f}<br>%{customdata[2]}"
+                         "<extra></extra>", **common), row=1, col=2)
+    fig.add_vline(x=1.2, line=dict(color=COLORS["exit_line"], dash="dash", width=1), row=1, col=2,
+                  annotation_text="min 1.2", annotation_position="top")
+    for name, color in [("Passed validation", COLORS["win"]), ("Failed validation", COLORS["loss"])]:
+        fig.add_trace(go.Bar(x=[None], y=[None], marker_color=color, name=name))
+    fig.update_layout(hovermode="closest")
+    return _style(fig, "Backtest validation", height=max(350, 80 + 45 * len(df)))
+
+
+# ---------------------------------------------------------------------------
+# 6. One-call helper: live data -> backtest -> charts
+# ---------------------------------------------------------------------------
+
+def chart_pair_backtest(
+    leg_y: str,
+    leg_x: str,
+    horizon: HorizonMode = HorizonMode.MULTIDAY,
+    lookback_days: int = 60,
+    bt_config: Optional[BacktestConfig] = None,
+    data_client: Optional[HyperliquidDataClient] = None,
+) -> Tuple[PairBacktestMetrics, Dict[str, go.Figure]]:
+    """
+    Fetches candles and funding history from Hyperliquid, backtests one pair and returns
+    (metrics, {"dashboard": ..., "trades": ..., "prices": ...}).
+    """
+    client = data_client or HyperliquidDataClient()
+    cfg = bt_config or BacktestConfig()
+    hp = HorizonConfig.for_horizon(horizon)
+    now_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
+    start_ms = now_ms - lookback_days * 24 * 3_600_000
+    bars = int(lookback_days * 24 * 60 / hp.bar_minutes)
+
+    df_y = client.get_candles(leg_y, hp.candle_interval, bars, end_time_ms=now_ms)
+    df_x = client.get_candles(leg_x, hp.candle_interval, bars, end_time_ms=now_ms)
+    f_y = fetch_historical_funding_series(client, leg_y, start_ms, now_ms) if cfg.use_historical_funding else None
+    f_x = fetch_historical_funding_series(client, leg_x, start_ms, now_ms) if cfg.use_historical_funding else None
+
+    pair = PairConfig(leg_y=leg_y, leg_x=leg_x,
+                      asset_class=pair_bucket(classify_asset(leg_y), classify_asset(leg_x)).value,
+                      horizon=horizon)
+    metrics, equity, trades = HyperliquidPairsBacktester(client, cfg).run_backtest(pair, df_y, df_x, f_y, f_x)
+    figs = {
+        "dashboard": plot_backtest_dashboard(equity, trades, pair, metrics, warmup_bars=cfg.warmup_bars),
+        "trades": plot_trade_pnl(trades, title=f"{leg_y} / {leg_x} trade PnL"),
+        "prices": plot_pair_prices(df_y, df_x, leg_y, leg_x, horizon),
+    }
+    return metrics, figs
+
+
+if __name__ == "__main__":
+    # Offline demo on simulated cointegrated pairs (no network needed).
+    # For real Hyperliquid data instead:
+    #     metrics, figs = chart_pair_backtest("SUI", "SOL", HorizonMode.MULTIDAY, lookback_days=60)
+    #     figs["dashboard"].show()
+    import math
+
+    def simulate(seed: int, half_life: float, noise: float, n_bars: int = 1440):  # 60 days of 1h bars
+        rng = np.random.default_rng(seed)
+        dates = pd.date_range("2026-09-20", periods=n_bars, freq="1h", tz="UTC")
+        price_x = 100.0 * np.exp(np.cumsum(rng.normal(0.0002, 0.012, n_bars)))
+        phi = math.exp(-math.log(2) / half_life)
+        spread = np.zeros(n_bars)
+        for t in range(1, n_bars):
+            spread[t] = phi * spread[t - 1] + rng.normal(0.0, noise)
+        price_y = 1.65 * price_x + 12.0 + spread
+        return pd.DataFrame({"close": price_y}, index=dates), pd.DataFrame({"close": price_x}, index=dates)
+
+    bt_cfg = BacktestConfig(initial_capital=10_000.0, allocation_per_pair=2_500.0)
+    backtester = HyperliquidPairsBacktester(bt_config=bt_cfg)
+    out_dir = "charts"
+    results = []
+    for i, (seed, hl, noise) in enumerate([(42, 18.0, 1.8), (7, 30.0, 1.2), (11, 10.0, 2.5)], start=1):
+        df_y, df_x = simulate(seed, hl, noise)
+        pair = PairConfig(leg_y=f"DEMO_Y{i}", leg_x=f"DEMO_X{i}", asset_class="CRYPTO", horizon=HorizonMode.MULTIDAY)
+        metrics, equity, trades = backtester.run_backtest(pair, df_y, df_x)
+        results.append(asdict(metrics))
+        if i == 1:
+            print(save_figure(plot_backtest_dashboard(equity, trades, pair, metrics, bt_cfg.warmup_bars),
+                              f"{out_dir}/backtest_dashboard.html"))
+            print(save_figure(plot_trade_pnl(trades), f"{out_dir}/trade_pnl.html"))
+            print(save_figure(plot_pair_prices(df_y, df_x, pair.leg_y, pair.leg_x), f"{out_dir}/pair_prices.html"))
+
+    print(save_figure(plot_validation_summary(pd.DataFrame(results)), f"{out_dir}/validation_summary.html"))
+    print("Open the HTML files above in a browser (or call fig.show() in Jupyter).")
 ```
