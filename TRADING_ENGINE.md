@@ -1,6 +1,6 @@
 # Trading Engine
 
-Code cells only (no outputs), in notebook order. Source paths are given for each. Sections 20–24 add a Hyperliquid pairs-trading engine: a design spec plus four Python modules, each meant to be saved under the file name shown so they can import each other.
+Code cells only (no outputs), in notebook order. Source paths are given for each. Sections 20–25 add a Hyperliquid pairs-trading engine: a design spec, four Python modules and a runner. Save each module in one folder under the file name shown (they import each other), then run `python run_trading_engine.py` to scan, backtest and paper-trade. Paper mode places no orders.
 
 **Requirements:** `pip install numpy pandas scipy plotly matplotlib scikit-learn statsmodels yfinance ipywidgets qfin openpyxl ipython requests`. Live trading in section 24 also needs `pip install hyperliquid-python-sdk eth-account` (paper mode does not). No Interactive Brokers account is needed. Lectures 47, 88, 100, 113, 119 and 138 originally read CSVs produced by IB scripts (or missing from the repo), so their sections now begin with a `yfinance` data-setup block that writes the same files.
 
@@ -25,11 +25,12 @@ Code cells only (no outputs), in notebook order. Source paths are given for each
 17. **Analyzing Stock Returns with Principal Component Analysis in Python (Lecture 17)** — PCA of stock returns (SVD and covariance eigendecomposition) for risk factors and decorrelation.
 18. **Black-Litterman vs. Mean-Variance Portfolio Optimization in Python (Lecture 100)** — Black-Litterman vs mean-variance optimization.
 19. **How a Quant Manages a Portfolio (Lecture 88)** — Factor-model portfolio management.
-20. **Pairs Trading Strategy Engine Specification (`hyperliquid_pairs_strategy_engine.md`)** — Design spec for the Hyperliquid pairs engine: methods, asset buckets, intraday vs multi-day parameters, Kalman/OU/funding maths and agent prompts.
-21. **Pairs Strategy Engine (`pairs_strategy_engine.py`)** — Kalman-filter hedge ratio, OU half-life gate, funding-drag check, NYSE-hours filter and portfolio caps; produces entry/exit signals.
-22. **Hyperliquid Pair Scanner (`hyperliquid_pair_scanner.py`)** — Ranks Hyperliquid perps by 24h volume and screens the top N for cointegrated pairs (Engle-Granger + OU half-life).
-23. **Hyperliquid Pairs Backtester (`hyperliquid_pairs_backtester.py`)** — Walk-forward backtester with maker/taker fees, hourly funding PnL and Sharpe/Sortino/drawdown metrics.
+20. **Pairs Trading Strategy Engine Specification (`hyperliquid_pairs_strategy_engine.md`)** — Design spec for the Hyperliquid pairs engine: methods, asset buckets, intraday vs multi-day parameters, Kalman/OU/funding maths and agent prompts. Implementation notes mark where the working code differs.
+21. **Pairs Strategy Engine (`pairs_strategy_engine.py`)** — Core module the others import: Kalman hedge ratio, OU half-life gate, funding-drag check, NYSE-hours filter, portfolio caps, beta-neutral sizing and the Hyperliquid data client.
+22. **Hyperliquid Pair Scanner (`hyperliquid_pair_scanner.py`)** — Ranks Hyperliquid perps (main + builder dexes) by 24h volume and screens the top N for cointegrated pairs (Engle-Granger + OU half-life).
+23. **Hyperliquid Pairs Backtester (`hyperliquid_pairs_backtester.py`)** — Walk-forward backtester with maker/taker fees, hourly funding PnL and Sharpe/Sortino/drawdown metrics; validates scanner output.
 24. **Hyperliquid Execution Controller (`hyperliquid_execution_controller.py`)** — Two-leg order execution: post-only limit on the less liquid leg, then an IOC hedge on the liquid leg; paper mode by default.
+25. **End-to-End Runner (`run_trading_engine.py`)** — Wires sections 21–24 together: scan, backtest, keep validated pairs, then poll signals and paper-trade entries and exits.
 
 ---
 
@@ -21148,7 +21149,7 @@ fig.show()
 
 ## 20. Pairs Trading Strategy Engine Specification (`hyperliquid_pairs_strategy_engine.md`)
 
-`hyperliquid_pairs_strategy_engine.md` — Design spec for the Hyperliquid pairs engine: methods, asset buckets, intraday vs multi-day parameters, Kalman/OU/funding maths and agent prompts.
+Design spec for the Hyperliquid pairs engine: methods, asset buckets, intraday vs multi-day parameters, Kalman/OU/funding maths and agent prompts. Implementation notes mark where the working code differs.
 
 ### Pairs Trading Strategy Engine Specification & Multi-Asset Playbook
 
@@ -21214,6 +21215,8 @@ Model the relationship between dependent asset $Y_t$ (less liquid leg) and indep
   $$\theta_t = \theta_{t-1} + \omega_t, \quad \omega_t \sim \mathcal{N}(0, Q)$$
   Where $\theta_t = [\beta_t, \alpha_t]^T$ is the hidden state vector, $H_t = [X_t, 1]$ is the observation row vector, $R$ is measurement noise variance, and $Q = \frac{\delta}{1 - \delta} I_2$ is the state transition covariance matrix parameterized by adaptation rate $\delta$.
 
+> **Implementation note (section 21):** fixed values of $R$ and $Q$ only suit one price level, so the engine makes them scale-free. It runs the filter on $Y_t/Y_0$ and $X_t/X_0$, sets $Q_t = \frac{\delta}{1-\delta} R_t I_2$ (so $\delta$ is hedge-ratio drift *relative to* spread noise), and estimates $R_t$ from past residuals only (running mean of $e_t^2$, then a 200-bar exponential average). Outputs are converted back to price units. With the literal $R = 10^{-3}$ and absolute $Q$, $|Z|$ is mis-scaled on most pairs and the half-life gate rejects everything.
+
 **Recursive Update Steps at Bar $t$:**
 1. **Predict State & Error Covariance:**
    $$\hat{\theta}_{t|t-1} = \hat{\theta}_{t-1|t-1}$$
@@ -21243,15 +21246,18 @@ $$\Delta e_t = \gamma e_{t-1} + c + \eta_t$$
   $$t_{1/2} = \frac{-\ln(2)}{\ln(1 + \gamma)} \approx \frac{\ln(2)}{\lambda}$$
 * Convert $t_{1/2}$ from bars to minutes/hours using bar duration $\Delta t$ and enforce horizon gates ($[15\text{m}, 240\text{m}]$ intraday; $[12\text{h}, 96\text{h}]$ multi-day).
 
+> **Implementation note:** the AR(1) fit uses the *hedged* spread $Y_k - \beta_t X_k - \alpha_t$ over the last $N$ bars, with today's $\beta_t, \alpha_t$ (past prices only). The one-step Kalman residuals revert much faster than the position you actually hold, because the filter keeps adapting to the spread.
+
 ---
 
 ##### 4.3 Beta-Neutral Sizing & Hyperliquid Hourly Funding Hurdle
 Given allocated pair risk capital $V_{\text{capital}}$ (USDC):
 
 * **Beta-Neutral Notional Allocation:**
-  $$\text{Notional}_Y = \frac{V_{\text{capital}}}{1 + |\beta_t|}, \quad \text{Notional}_X = |\beta_t| \cdot \text{Notional}_Y$$
-* **Expected Gross Spread Capture:**
-  $$\text{Expected Gross Edge} = |Z_{\text{entry}}| \cdot \sqrt{S_t}$$
+  $\beta_t$ comes from a price-level regression, so it is a *unit* ratio: hold $|\beta_t|$ units of $X$ per unit of $Y$. In dollars:
+  $$\text{Notional}_Y = \frac{V_{\text{capital}}}{1 + |\beta_t| P_X / P_Y}, \quad \text{Notional}_X = |\beta_t| \cdot \frac{P_X}{P_Y} \cdot \text{Notional}_Y$$
+* **Expected Gross Spread Capture** ($\sqrt{S_t}$ is in $Y$ price units; convert to USDC with the units of $Y$ held):
+  $$\text{Expected Gross Edge} = |Z_{\text{entry}}| \cdot \sqrt{S_t} \cdot \frac{\text{Notional}_Y}{P_Y}$$
 * **Net Hourly Funding Yield ($F_{\text{net}}$):**
   Hyperliquid settles funding every 1 hour. Let $f_Y, f_X$ denote the 1-hour funding rates for assets $Y$ and $X$, and $\text{side} \in \{+1 \text{ (Long)}, -1 \text{ (Short)}\}$:
   $$F_{\text{net}} = \text{side}_Y \cdot (-f_Y) + \text{side}_X \cdot (-f_X)$$
@@ -21318,6 +21324,8 @@ STRICT GUARDRAILS:
 ---
 
 #### 6. Reference Python Engine Skeleton (`pairs_strategy_engine.py`)
+
+> Original sketch, kept for reference. The working engine is `pairs_strategy_engine.py` (section 21).
 
 ```python
 import numpy as np
@@ -21404,7 +21412,7 @@ def evaluate_funding_hurdle(
 
 ## 21. Pairs Strategy Engine (`pairs_strategy_engine.py`)
 
-`pairs_strategy_engine.py` — Kalman-filter hedge ratio, OU half-life gate, funding-drag check, NYSE-hours filter and portfolio caps; produces entry/exit signals.
+Core module the others import: Kalman hedge ratio, OU half-life gate, funding-drag check, NYSE-hours filter, portfolio caps, beta-neutral sizing and the Hyperliquid data client.
 
 Save as `pairs_strategy_engine.py`.
 
@@ -21421,10 +21429,10 @@ from __future__ import annotations
 import logging
 import math
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime, time as dt_time
 from enum import Enum
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, NamedTuple, Optional, Tuple
 from zoneinfo import ZoneInfo
 
 import numpy as np
@@ -21455,6 +21463,7 @@ class SignalStatus(str, Enum):
     READY = "READY"
     LONG_SPREAD = "LONG_SPREAD"      # Buy Y, Sell beta * X
     SHORT_SPREAD = "SHORT_SPREAD"    # Sell Y, Buy beta * X
+    HOLD = "HOLD"                    # Position open, no exit condition hit
     EXIT_MEAN = "EXIT_MEAN"
     STOP_LOSS = "STOP_LOSS"
     REJECT_NON_STATIONARY = "REJECT_NON_STATIONARY"
@@ -21478,6 +21487,36 @@ class HorizonConfig:
     min_corr_24h: float
     ou_lookback_bars: int = 200
     max_funding_drag_ratio: float = 0.30
+    obs_noise_r: Optional[float] = None  # Kalman R; None = estimate from past residuals
+
+    @property
+    def bar_hours(self) -> float:
+        return self.bar_minutes / 60.0
+
+    @property
+    def candle_interval(self) -> str:
+        return {1: "1m", 5: "5m", 15: "15m", 60: "1h", 240: "4h", 1440: "1d"}[self.bar_minutes]
+
+    @property
+    def min_half_life_mins(self) -> float:
+        return self.min_half_life_bars * self.bar_minutes
+
+    @property
+    def max_half_life_mins(self) -> float:
+        return self.max_half_life_bars * self.bar_minutes
+
+    @classmethod
+    def for_horizon(cls, mode: HorizonMode) -> "HorizonConfig":
+        """Returns a fresh copy of the default config for a horizon."""
+        return replace(DEFAULT_CONFIGS[HorizonMode(mode)])
+
+    @classmethod
+    def intraday(cls) -> "HorizonConfig":
+        return cls.for_horizon(HorizonMode.INTRADAY)
+
+    @classmethod
+    def multiday(cls) -> "HorizonConfig":
+        return cls.for_horizon(HorizonMode.MULTIDAY)
 
 
 DEFAULT_CONFIGS: Dict[HorizonMode, HorizonConfig] = {
@@ -21506,6 +21545,72 @@ DEFAULT_CONFIGS: Dict[HorizonMode, HorizonConfig] = {
         ou_lookback_bars=200,
     ),
 }
+
+
+# Base tickers used to classify Hyperliquid perps. Builder-deployed (HIP-3) coins are
+# named "<dex>:<TICKER>", e.g. "xyz:NVDA"; the prefix is ignored for matching.
+COMMODITY_TICKERS = {
+    "GOLD", "XAU", "SILVER", "XAG", "WTI", "BRENT", "OIL", "CL", "NATGAS", "NG",
+    "COPPER", "HG", "PLATINUM", "PALLADIUM",
+}
+STOCK_TICKERS = {
+    "NVDA", "AMD", "TSLA", "AAPL", "MSFT", "GOOGL", "GOOG", "AMZN", "META", "NFLX",
+    "COIN", "MSTR", "HOOD", "PLTR", "INTC", "AVGO", "ORCL", "CRCL", "SPY", "QQQ",
+}
+
+
+def classify_asset(symbol: str) -> AssetBucket:
+    """
+    Heuristic asset-class tag for a Hyperliquid perp symbol.
+    Known commodity / stock tickers are matched first; any other coin on a
+    builder-deployed dex ("dex:TICKER") is treated as a stock perp, and everything
+    on the main dex defaults to crypto. Extend the ticker sets above as needed.
+    """
+    base = symbol.split(":")[-1].upper()
+    if base in COMMODITY_TICKERS:
+        return AssetBucket.COMMODITY
+    if base in STOCK_TICKERS:
+        return AssetBucket.STOCK_PERP
+    if ":" in symbol:
+        return AssetBucket.STOCK_PERP
+    return AssetBucket.CRYPTO
+
+
+def pair_bucket(class_y: AssetBucket, class_x: AssetBucket) -> AssetBucket:
+    """
+    Risk bucket for a pair. Any pair with a stock leg is STOCK_PERP so that NYSE-hours
+    and weekend rules apply to it; other mixed pairs are CROSS_ASSET.
+    """
+    if AssetBucket.STOCK_PERP in (class_y, class_x):
+        return AssetBucket.STOCK_PERP
+    if class_y == class_x:
+        return class_y
+    return AssetBucket.CROSS_ASSET
+
+
+def beta_neutral_notionals(
+    capital: float, beta: float, price_y: float, price_x: float
+) -> Tuple[float, float]:
+    """
+    Splits capital between the legs so the position is beta-neutral.
+    beta comes from the price-level regression Y = beta * X + alpha, so it is a
+    UNIT ratio: hold beta units of X per unit of Y. In dollar terms
+        Notional_X = |beta| * (P_X / P_Y) * Notional_Y,   Notional_Y + Notional_X = capital.
+    """
+    if price_y <= 0 or price_x <= 0:
+        return 0.0, 0.0
+    ratio = abs(beta) * price_x / price_y
+    notional_y = capital / (1.0 + ratio)
+    return notional_y, ratio * notional_y
+
+
+@dataclass
+class PairConfig:
+    """Pair definition used by the backtester (no capital or id needed)."""
+    leg_y: str
+    leg_x: str
+    asset_class: str  # an AssetBucket value, e.g. "CRYPTO" or "STOCK_PERP"
+    horizon: HorizonMode
 
 
 @dataclass
@@ -21545,8 +21650,13 @@ class HyperliquidDataClient:
     """
 
     MAINNET_INFO_URL = "https://api.hyperliquid.xyz/info"
+    MAX_CANDLES_PER_REQUEST = 5000  # Hyperliquid candleSnapshot cap
 
     def __init__(self, base_url: str = MAINNET_INFO_URL, timeout: int = 10):
+        # Accept either the API root ("https://api.hyperliquid.xyz") or the /info URL
+        base_url = base_url.rstrip("/")
+        if not base_url.endswith("/info"):
+            base_url = f"{base_url}/info"
         self.base_url = base_url
         self.timeout = timeout
 
@@ -21561,11 +21671,17 @@ class HyperliquidDataClient:
         raw = self._post({"type": "allMids"})
         return {k: float(v) for k, v in raw.items()}
 
-    def get_meta_and_asset_ctxs(self) -> Tuple[List[str], Dict[str, Dict[str, float]]]:
+    def get_meta_and_asset_ctxs(
+        self, dex: Optional[str] = None
+    ) -> Tuple[List[str], Dict[str, Dict[str, float]]]:
         """
         Returns universe list and mapping of coin -> {funding, openInterest, markPx, oraclePx}.
+        Pass dex="<name>" for a builder-deployed (HIP-3) dex; None is the main dex.
         """
-        data = self._post({"type": "metaAndAssetCtxs"})
+        payload: Dict[str, Any] = {"type": "metaAndAssetCtxs"}
+        if dex:
+            payload["dex"] = dex
+        data = self._post(payload)
         universe = [item["name"] for item in data[0]["universe"]]
         ctxs = data[1]
         result: Dict[str, Dict[str, float]] = {}
@@ -21588,6 +21704,9 @@ class HyperliquidDataClient:
         """
         Fetches historical OHLCV candles from Hyperliquid.
         Supported intervals: '1m', '5m', '15m', '1h', '4h', '1d'.
+        Returns a DataFrame indexed by UTC candle open time (index name "timestamp")
+        with columns open/high/low/close/volume. Long requests are paged in
+        5000-candle chunks.
         """
         interval_ms_map = {
             "1m": 60_000,
@@ -21600,65 +21719,115 @@ class HyperliquidDataClient:
         if interval not in interval_ms_map:
             raise ValueError(f"Unsupported interval: {interval}")
 
+        cols = ["open", "high", "low", "close", "volume"]
+        step_ms = interval_ms_map[interval]
         end_ms = end_time_ms or int(time.time() * 1000)
-        start_ms = end_ms - (lookback_bars * interval_ms_map[interval])
+        start_ms = end_ms - (lookback_bars * step_ms)
 
-        payload = {
-            "type": "candleSnapshot",
-            "req": {
-                "coin": coin,
-                "interval": interval,
-                "startTime": start_ms,
-                "endTime": end_ms,
-            },
-        }
-        raw = self._post(payload)
+        raw: List[Dict[str, Any]] = []
+        cursor = start_ms
+        while cursor < end_ms:
+            chunk_end = min(end_ms, cursor + self.MAX_CANDLES_PER_REQUEST * step_ms)
+            payload = {
+                "type": "candleSnapshot",
+                "req": {
+                    "coin": coin,
+                    "interval": interval,
+                    "startTime": cursor,
+                    "endTime": chunk_end,
+                },
+            }
+            batch = self._post(payload) or []
+            raw.extend(batch)
+            cursor = chunk_end
+
         if not raw:
-            return pd.DataFrame(columns=["timestamp", "open", "high", "low", "close", "volume"])
+            empty = pd.DataFrame(columns=cols, dtype=float)
+            empty.index = pd.DatetimeIndex([], tz="UTC", name="timestamp")
+            return empty
 
         df = pd.DataFrame(raw)
         df = df.rename(
             columns={"t": "timestamp", "o": "open", "h": "high", "l": "low", "c": "close", "v": "volume"}
         )
-        for col in ["open", "high", "low", "close", "volume"]:
+        for col in cols:
             df[col] = df[col].astype(float)
         df["timestamp"] = pd.to_datetime(df["timestamp"], unit="ms", utc=True)
-        return df[["timestamp", "open", "high", "low", "close", "volume"]].sort_values("timestamp").reset_index(drop=True)
+        df = df.drop_duplicates("timestamp").set_index("timestamp").sort_index()
+        return df[cols]
+
+    # Alias used by HyperliquidPairScanner
+    fetch_candles = get_candles
+
+
+class KalmanState(NamedTuple):
+    """One Kalman update. Unpacks like a tuple: beta, alpha, spread, forecast_std, z_score."""
+    beta: float
+    alpha: float
+    spread: float
+    forecast_std: float
+    z_score: float
 
 
 class KalmanPairsFilter:
     """
     1D Recursive Kalman Filter for dynamic hedge ratio (beta_t) and intercept (alpha_t).
     Observation: Y_t = beta_t * X_t + alpha_t + eps_t
+
+    Scale handling (so the same delta works for any pair):
+    - The filter runs on prices divided by their first observed value (Y/Y_0, X/X_0).
+    - State noise is scaled by the observation noise: Q_t = delta / (1 - delta) * R_t * I.
+      delta is then a dimensionless "hedge-ratio drift vs spread noise" ratio (higher =
+      faster adaptation). With an absolute Q = delta/(1-delta) * I, how fast beta may move
+      depends on each pair's price level and spread width: on most pairs the filter absorbs
+      the whole spread and |Z| never reaches the entry threshold.
+    - Observation noise R must match the spread's variance. A fixed R such as 1e-3 only
+      suits one price level; otherwise |Z| is badly mis-scaled and the OU half-life of the
+      residuals collapses below one bar. With obs_variance=None (default) R is estimated
+      from past residuals only: a running mean of e_t^2 for the first `r_window` bars,
+      then an exponential average with the same span. No future data is used.
+    All outputs (beta, alpha, spread, forecast_std) are returned in ORIGINAL price units;
+    a fixed obs_variance is also given in original Leg Y price units squared.
     """
 
-    def __init__(self, delta: float = 1e-4, obs_variance: float = 1e-3):
+    def __init__(self, delta: float = 1e-4, obs_variance: Optional[float] = None, r_window: int = 200):
         self.delta = delta
-        self.R = obs_variance
+        self.adaptive_r = obs_variance is None
+        self.fixed_r = obs_variance
+        self.R = 0.0
+        self.r_window = max(2, int(r_window))
+        self._n_obs = 0
         self.Q = (delta / (1.0 - delta)) * np.eye(2)
-        self.theta = np.zeros(2)  # [beta, alpha]
+        self.theta = np.zeros(2)  # [beta, alpha] in normalised units
         self.P = np.eye(2)
+        self.y0 = 1.0
+        self.x0 = 1.0
         self.initialized = False
 
-    def update(self, y: float, x: float) -> Tuple[float, float, float, float, float]:
+    def update(self, y: float, x: float) -> KalmanState:
         """
         Processes one observation (y, x).
-        Returns: (beta, alpha, spread_e, forecast_std, z_score)
+        Returns: KalmanState(beta, alpha, spread, forecast_std, z_score) in original units.
         """
-        H = np.array([x, 1.0])
-
         if not self.initialized:
-            self.theta = np.array([y / x if x != 0 else 1.0, 0.0])
+            self.y0 = y if y != 0 else 1.0
+            self.x0 = x if x != 0 else 1.0
+            self.theta = np.array([1.0, 0.0])  # Y/Y0 ~= X/X0 at the start
+            # starting guess for R: 1% of price; replaced by data when adaptive
+            self.R = 1e-4 if self.adaptive_r else self.fixed_r / (self.y0 ** 2)
             self.initialized = True
 
-        # 1. Predict
+        yn, xn = y / self.y0, x / self.x0
+        H = np.array([xn, 1.0])
+
+        # 1. Predict (state noise scaled by current observation noise, see class docstring)
         theta_pred = self.theta
-        P_pred = self.P + self.Q
+        P_pred = self.P + self.Q * self.R
 
         # 2. Residual & Forecast Variance
-        e_t = y - float(H @ theta_pred)
+        e_t = yn - float(H @ theta_pred)
         S_t = float(H @ P_pred @ H.T) + self.R
-        forecast_std = math.sqrt(max(S_t, 1e-12))
+        forecast_std = math.sqrt(max(S_t, 1e-18))
 
         # 3. Kalman Gain
         K_t = (P_pred @ H.T) / S_t
@@ -21667,8 +21836,18 @@ class KalmanPairsFilter:
         self.theta = theta_pred + K_t * e_t
         self.P = (np.eye(2) - np.outer(K_t, H)) @ P_pred
 
+        # 5. Update R for the NEXT bar from this bar's residual (no look-ahead)
+        if self.adaptive_r:
+            self._n_obs += 1
+            if self._n_obs > 1:  # the first residual is 0 by construction
+                weight = max(1.0 / (self._n_obs - 1), 2.0 / (self.r_window + 1))
+                self.R = max((1.0 - weight) * self.R + weight * e_t * e_t, 1e-18)
+
         z_t = e_t / forecast_std
-        return float(self.theta[0]), float(self.theta[1]), e_t, forecast_std, z_t
+        # Convert back to original price units
+        beta = float(self.theta[0]) * self.y0 / self.x0
+        alpha = float(self.theta[1]) * self.y0
+        return KalmanState(beta, alpha, float(e_t * self.y0), forecast_std * self.y0, float(z_t))
 
     def fit_series(self, y_series: np.ndarray, x_series: np.ndarray) -> pd.DataFrame:
         records = []
@@ -21709,6 +21888,16 @@ def estimate_ou_half_life(spread_series: np.ndarray) -> Tuple[float, float]:
     return gamma, half_life
 
 
+def hedged_spread(y_prices: np.ndarray, x_prices: np.ndarray, beta: float, alpha: float) -> np.ndarray:
+    """
+    Spread actually held once a trade is on: Y - beta_t * X - alpha_t, using the CURRENT
+    Kalman hedge ratio over past bars (no future data). Use this, not the Kalman
+    one-step residuals, for the OU half-life gate: the filter keeps adapting to the
+    spread, so its residuals revert far faster than the position does.
+    """
+    return np.asarray(y_prices, dtype=float) - beta * np.asarray(x_prices, dtype=float) - alpha
+
+
 def compute_rolling_correlation(y_series: np.ndarray, x_series: np.ndarray, window: int) -> float:
     if len(y_series) < window + 1 or len(x_series) < window + 1:
         window = min(len(y_series), len(x_series)) - 1
@@ -21739,6 +21928,38 @@ class PortfolioRiskSupervisor:
         self.max_cross_pair_spread_corr = max_cross_pair_spread_corr
         self.active_positions: Dict[str, Dict[str, Any]] = {}
         self.active_spread_histories: Dict[str, np.ndarray] = {}
+
+    def open_position(
+        self,
+        pair_spec: "PairSpec",
+        side: int,
+        notional_y: float,
+        notional_x: float,
+        qty_y: float = 0.0,
+        qty_x: float = 0.0,
+        spread_history: Optional[np.ndarray] = None,
+    ) -> None:
+        """
+        Records a filled pair so later evaluate_pair() calls check exits instead of entries.
+        side: +1 for LONG_SPREAD, -1 for SHORT_SPREAD.
+        """
+        self.active_positions[pair_spec.pair_id] = {
+            "side": side,
+            "bucket": pair_spec.bucket,
+            "leg_y": pair_spec.leg_y,
+            "leg_x": pair_spec.leg_x,
+            "notional_y": notional_y,
+            "notional_x": notional_x,
+            "qty_y": qty_y,
+            "qty_x": qty_x,
+        }
+        if spread_history is not None:
+            self.active_spread_histories[pair_spec.pair_id] = np.asarray(spread_history, dtype=float)
+
+    def close_position(self, pair_id: str) -> Optional[Dict[str, Any]]:
+        """Removes a pair after it has been closed. Returns its stored record, if any."""
+        self.active_spread_histories.pop(pair_id, None)
+        return self.active_positions.pop(pair_id, None)
 
     def check_stock_perp_hours(
         self,
@@ -21788,11 +22009,14 @@ class PortfolioRiskSupervisor:
         bar_minutes: int,
         entry_z: float,
         forecast_std: float,
+        price_y: float,
         max_drag_ratio: float = 0.30,
     ) -> Tuple[bool, float, str]:
         """
         Evaluates Hyperliquid hourly funding rate carry impact.
         Positive funding means longs pay shorts.
+        forecast_std is in Leg Y price units, so the expected USDC capture is
+        |Z| * forecast_std * (units of Y held) = |Z| * forecast_std * notional_y / price_y.
         """
         # Hourly USDC funding cashflow: paying funding is negative
         hourly_usdc_cf = (-side_y * funding_y_1h * notional_y) + (-side_x * funding_x_1h * notional_x)
@@ -21807,7 +22031,8 @@ class PortfolioRiskSupervisor:
 
         expected_hold_hours = 2.0 * half_life_bars * (bar_minutes / 60.0)
         projected_funding_cost = abs(hourly_usdc_cf) * expected_hold_hours
-        expected_gross_capture = abs(entry_z) * forecast_std * notional_y
+        units_y = notional_y / price_y if price_y > 0 else 0.0
+        expected_gross_capture = abs(entry_z) * forecast_std * units_y
 
         if expected_gross_capture > 0 and projected_funding_cost > (max_drag_ratio * expected_gross_capture):
             return (
@@ -21893,8 +22118,9 @@ class HyperliquidPairsStrategyEngine:
         cfg = self.configs[pair_spec.horizon]
 
         # 1. Fit Kalman Filter over price history
-        kf = KalmanPairsFilter(delta=cfg.kalman_delta)
+        kf = KalmanPairsFilter(delta=cfg.kalman_delta, obs_variance=cfg.obs_noise_r)
         kf_df = kf.fit_series(y_prices, x_prices)
+        price_y, price_x = float(y_prices[-1]), float(x_prices[-1])
         latest = kf_df.iloc[-1]
 
         beta = float(latest["beta"])
@@ -21908,7 +22134,9 @@ class HyperliquidPairsStrategyEngine:
         corr_24h = compute_rolling_correlation(y_prices, x_prices, window=bars_24h)
 
         # 3. Ornstein-Uhlenbeck Half-Life stationarity gate
-        spread_window = kf_df["spread"].values[-cfg.ou_lookback_bars :]
+        spread_window = hedged_spread(
+            y_prices[-cfg.ou_lookback_bars :], x_prices[-cfg.ou_lookback_bars :], beta, alpha
+        )
         gamma, half_life_bars = estimate_ou_half_life(spread_window)
 
         # 4. Beta-neutral notional sizing
@@ -21916,8 +22144,7 @@ class HyperliquidPairsStrategyEngine:
             pair_spec.bucket, pair_spec.horizon, now_utc=now_utc
         )
         effective_cap = pair_spec.capital_allocation_usdc * lev_mult
-        notional_y = effective_cap / (1.0 + abs(beta))
-        notional_x = abs(beta) * notional_y
+        notional_y, notional_x = beta_neutral_notionals(effective_cap, beta, price_y, price_x)
 
         # Check active position exits first
         is_open = pair_spec.pair_id in self.risk_supervisor.active_positions
@@ -21987,6 +22214,26 @@ class HyperliquidPairsStrategyEngine:
                     net_hourly_funding_rate=0.0,
                     reason=f"Z-score reverted to {z_score:.2f}",
                 )
+
+            # Position stays open: never emit a fresh entry on top of it
+            return PairSignalOutput(
+                pair_id=pair_spec.pair_id,
+                leg_y=pair_spec.leg_y,
+                leg_x=pair_spec.leg_x,
+                horizon=pair_spec.horizon,
+                status=SignalStatus.HOLD,
+                beta=beta,
+                alpha=alpha,
+                z_score=z_score,
+                spread=spread,
+                forecast_std=forecast_std,
+                half_life_bars=half_life_bars,
+                corr_24h=corr_24h,
+                notional_y=pos["notional_y"],
+                notional_x=pos["notional_x"],
+                net_hourly_funding_rate=0.0,
+                reason=f"Holding; Z={z_score:.2f} has not reached exit or stop",
+            )
 
         # Gate checks for new entries
         if not allowed_hours:
@@ -22093,6 +22340,7 @@ class HyperliquidPairsStrategyEngine:
                 bar_minutes=cfg.bar_minutes,
                 entry_z=z_score,
                 forecast_std=forecast_std,
+                price_y=price_y,
                 max_drag_ratio=cfg.max_funding_drag_ratio,
             )
             if not funding_ok:
@@ -22185,25 +22433,29 @@ class HyperliquidPairsStrategyEngine:
         """
         Pulls live candles and funding rates from Hyperliquid and evaluates all configured pairs.
         """
+        # Funding rates: main dex plus any builder dex named in a leg ("dex:COIN")
         _, asset_ctxs = self.data_client.get_meta_and_asset_ctxs()
+        builder_dexes = {
+            leg.split(":")[0] for spec in pairs for leg in (spec.leg_y, spec.leg_x) if ":" in leg
+        }
+        for dex in builder_dexes:
+            try:
+                _, dex_ctxs = self.data_client.get_meta_and_asset_ctxs(dex=dex)
+                asset_ctxs.update(dex_ctxs)
+            except Exception as exc:
+                logger.warning("Could not fetch asset contexts for dex=%s: %s", dex, exc)
         outputs: List[PairSignalOutput] = []
-
-        interval_str_map = {1: "1m", 5: "5m", 15: "15m", 60: "1h", 240: "4h"}
 
         for spec in pairs:
             cfg = self.configs[spec.horizon]
-            interval_str = interval_str_map.get(cfg.bar_minutes, "1h")
             lookback = max(cfg.ou_lookback_bars + 50, int((24 * 60) / cfg.bar_minutes) + 10)
 
-            df_y = self.data_client.get_candles(spec.leg_y, interval=interval_str, lookback_bars=lookback)
-            df_x = self.data_client.get_candles(spec.leg_x, interval=interval_str, lookback_bars=lookback)
+            df_y = self.data_client.get_candles(spec.leg_y, interval=cfg.candle_interval, lookback_bars=lookback)
+            df_x = self.data_client.get_candles(spec.leg_x, interval=cfg.candle_interval, lookback_bars=lookback)
 
-            merged = pd.merge(
-                df_y[["timestamp", "close"]].rename(columns={"close": "y"}),
-                df_x[["timestamp", "close"]].rename(columns={"close": "x"}),
-                on="timestamp",
-                how="inner",
-            ).sort_values("timestamp")
+            merged = pd.concat(
+                [df_y["close"].rename("y"), df_x["close"].rename("x")], axis=1, join="inner"
+            ).dropna().sort_index()
 
             if len(merged) < 50:
                 logger.warning("Insufficient overlapping candles for %s (%d bars)", spec.pair_id, len(merged))
@@ -22233,7 +22485,7 @@ if __name__ == "__main__":
     spread_sim = np.zeros(n_bars)
     for t in range(1, n_bars):
         spread_sim[t] = 0.85 * spread_sim[t - 1] + rng.normal(0, 0.35)
-    spread_sim[-1] = -1.6  # Force negative Z-score entry trigger
+    spread_sim[-1] = -2.0  # Force negative Z-score entry trigger
     y_sim = 1.4 * x_sim + 5.0 + spread_sim
 
     engine = HyperliquidPairsStrategyEngine(total_portfolio_equity=50_000.0)
@@ -22259,7 +22511,7 @@ if __name__ == "__main__":
 
 ## 22. Hyperliquid Pair Scanner (`hyperliquid_pair_scanner.py`)
 
-`hyperliquid_pair_scanner.py` — Ranks Hyperliquid perps by 24h volume and screens the top N for cointegrated pairs (Engle-Granger + OU half-life).
+Ranks Hyperliquid perps (main + builder dexes) by 24h volume and screens the top N for cointegrated pairs (Engle-Granger + OU half-life).
 
 Save as `hyperliquid_pair_scanner.py`.
 
@@ -22276,6 +22528,7 @@ from __future__ import annotations
 
 import itertools
 import logging
+import warnings
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -22285,12 +22538,15 @@ import requests
 from statsmodels.tsa.stattools import adfuller
 
 from pairs_strategy_engine import (
-    AssetClass,
+    AssetBucket,
     HorizonConfig,
     HorizonMode,
     HyperliquidDataClient,
+    PairConfig,
+    PairSpec,
     classify_asset,
     estimate_ou_half_life,
+    pair_bucket,
 )
 
 logger = logging.getLogger("hyperliquid_pair_scanner")
@@ -22301,8 +22557,8 @@ logger.setLevel(logging.INFO)
 class DiscoveredPair:
     leg_y: str
     leg_x: str
-    asset_class_y: AssetClass
-    asset_class_x: AssetClass
+    asset_class_y: AssetBucket
+    asset_class_x: AssetBucket
     volume_24h_y: float
     volume_24h_x: float
     adf_pvalue: float
@@ -22312,6 +22568,26 @@ class DiscoveredPair:
     corr_24h: float
     current_zscore: float
     bucket: str
+
+    @property
+    def asset_class(self) -> str:
+        """Risk bucket used by the backtester and engine (STOCK_PERP if either leg is a stock)."""
+        return pair_bucket(self.asset_class_y, self.asset_class_x).value
+
+    def to_pair_config(self, horizon: HorizonMode) -> PairConfig:
+        """Input for HyperliquidPairsBacktester.run_backtest()."""
+        return PairConfig(leg_y=self.leg_y, leg_x=self.leg_x, asset_class=self.asset_class, horizon=horizon)
+
+    def to_pair_spec(self, horizon: HorizonMode, capital_allocation_usdc: float) -> PairSpec:
+        """Input for HyperliquidPairsStrategyEngine.evaluate_pair() / scan_universe()."""
+        return PairSpec(
+            pair_id=f"{self.leg_y}/{self.leg_x}/{HorizonMode(horizon).value}",
+            leg_y=self.leg_y,
+            leg_x=self.leg_x,
+            bucket=AssetBucket(self.asset_class),
+            horizon=horizon,
+            capital_allocation_usdc=capital_allocation_usdc,
+        )
 
 
 class HyperliquidPairScanner:
@@ -22416,7 +22692,7 @@ class HyperliquidPairScanner:
         top_df = liquid_df.head(top_n).copy()
 
         if ensure_stocks_and_commodities:
-            for target_class in [AssetClass.STOCK.value, AssetClass.COMMODITY.value]:
+            for target_class in [AssetBucket.STOCK_PERP.value, AssetBucket.COMMODITY.value]:
                 existing = top_df[top_df["asset_class"] == target_class]
                 if len(existing) < 5:
                     extra = liquid_df[
@@ -22429,12 +22705,12 @@ class HyperliquidPairScanner:
         return top_df.sort_values(by="volume_24h_usd", ascending=False).reset_index(drop=True)
 
     @staticmethod
-    def _assign_bucket(class_y: AssetClass, class_x: AssetClass) -> str:
-        if class_y == AssetClass.CRYPTO and class_x == AssetClass.CRYPTO:
+    def _assign_bucket(class_y: AssetBucket, class_x: AssetBucket) -> str:
+        if class_y == AssetBucket.CRYPTO and class_x == AssetBucket.CRYPTO:
             return "CRYPTO_INTRA"
-        if class_y == AssetClass.STOCK and class_x == AssetClass.STOCK:
+        if class_y == AssetBucket.STOCK_PERP and class_x == AssetBucket.STOCK_PERP:
             return "STOCK_INTRA"
-        if class_y == AssetClass.COMMODITY and class_x == AssetClass.COMMODITY:
+        if class_y == AssetBucket.COMMODITY and class_x == AssetBucket.COMMODITY:
             return "COMMODITY_INTRA"
         return "CROSS_ASSET_MACRO"
 
@@ -22442,8 +22718,8 @@ class HyperliquidPairScanner:
         self,
         sym_y: str,
         sym_x: str,
-        class_y: AssetClass,
-        class_x: AssetClass,
+        class_y: AssetBucket,
+        class_x: AssetBucket,
         allow_cross_asset: bool,
     ) -> bool:
         if sym_y == sym_x:
@@ -22471,7 +22747,7 @@ class HyperliquidPairScanner:
         runs Engle-Granger cointegration (ADF on OLS residuals), checks OU half-life
         bounds, and returns ranked stationary pairs.
         """
-        cfg = HorizonConfig.intraday() if mode == HorizonMode.INTRADAY else HorizonConfig.multiday()
+        cfg = HorizonConfig.for_horizon(mode)
         universe_df = self.get_top_universe(top_n=top_n, ensure_stocks_and_commodities=True)
         if universe_df.empty:
             logger.warning("Universe dataframe is empty; check network or API status.")
@@ -22479,7 +22755,7 @@ class HyperliquidPairScanner:
 
         price_series: Dict[str, pd.Series] = {}
         vol_map: Dict[str, float] = {}
-        class_map: Dict[str, AssetClass] = {}
+        class_map: Dict[str, AssetBucket] = {}
 
         for _, row in universe_df.iterrows():
             sym = row["symbol"]
@@ -22487,7 +22763,7 @@ class HyperliquidPairScanner:
             if len(df_candles) >= max(80, lookback_bars // 2):
                 price_series[sym] = df_candles["close"]
                 vol_map[sym] = float(row["volume_24h_usd"])
-                class_map[sym] = AssetClass(row["asset_class"])
+                class_map[sym] = AssetBucket(row["asset_class"])
 
         symbols = list(price_series.keys())
         discovered: List[DiscoveredPair] = []
@@ -22536,16 +22812,21 @@ class HyperliquidPairScanner:
             spread = y_vals - (beta_ols * x_vals + alpha_ols)
 
             # 3. Engle-Granger Step 2: Augmented Dickey-Fuller stationarity test
+            # With autolag=None adfuller returns 5 values (no icbest); index the p-value
+            # instead of unpacking so this works across statsmodels versions.
             try:
-                adf_stat, p_value, _, _, _, _ = adfuller(spread, maxlag=1, autolag=None)
-            except Exception:
+                with warnings.catch_warnings():
+                    warnings.simplefilter("ignore", FutureWarning)  # statsmodels return-type notice
+                    p_value = float(adfuller(spread, maxlag=1, autolag=None)[1])
+            except Exception as exc:
+                logger.debug(f"ADF failed for {leg_y}/{leg_x}: {exc}")
                 continue
 
             if p_value > adf_pvalue_threshold:
                 continue
 
             # 4. Ornstein-Uhlenbeck half-life gate
-            half_life_bars, _ = estimate_ou_half_life(spread)
+            _, half_life_bars = estimate_ou_half_life(spread)
             if not np.isfinite(half_life_bars):
                 continue
             if not (cfg.min_half_life_bars <= half_life_bars <= cfg.max_half_life_bars):
@@ -22592,7 +22873,7 @@ if __name__ == "__main__":
 
 ## 23. Hyperliquid Pairs Backtester (`hyperliquid_pairs_backtester.py`)
 
-`hyperliquid_pairs_backtester.py` — Walk-forward backtester with maker/taker fees, hourly funding PnL and Sharpe/Sortino/drawdown metrics.
+Walk-forward backtester with maker/taker fees, hourly funding PnL and Sharpe/Sortino/drawdown metrics; validates scanner output.
 
 Save as `hyperliquid_pairs_backtester.py`.
 
@@ -22632,21 +22913,19 @@ from zoneinfo import ZoneInfo
 import numpy as np
 import pandas as pd
 
-try:
-    from pairs_strategy_engine import (
-        HorizonMode,
-        PairConfig,
-        StrategyHyperparams,
-        HyperliquidDataClient,
-        KalmanPairsFilter,
-        estimate_ou_half_life,
-        compute_rolling_correlation,
-    )
-    from hyperliquid_pair_scanner import PairCandidate
-except ImportError:
-    raise ImportError(
-        "pairs_strategy_engine.py and hyperliquid_pair_scanner.py must be in PYTHONPATH."
-    )
+# pairs_strategy_engine.py and hyperliquid_pair_scanner.py must sit in the same folder
+from pairs_strategy_engine import (
+    HorizonConfig,
+    HorizonMode,
+    PairConfig,
+    HyperliquidDataClient,
+    KalmanPairsFilter,
+    beta_neutral_notionals,
+    estimate_ou_half_life,
+    compute_rolling_correlation,
+    hedged_spread,
+)
+from hyperliquid_pair_scanner import DiscoveredPair
 
 logger = logging.getLogger("hyperliquid_pairs_backtester")
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
@@ -22748,7 +23027,7 @@ def fetch_historical_funding_series(
     while cursor_ms < end_ms:
         payload = {"type": "fundingHistory", "coin": coin, "startTime": cursor_ms, "endTime": end_ms}
         try:
-            batch = client._post_info(payload)
+            batch = client._post(payload)
         except Exception as exc:
             logger.warning(f"Funding history fetch failed for {coin}: {exc}")
             break
@@ -22831,7 +23110,7 @@ class HyperliquidPairsBacktester:
         Executes a bar-by-bar walk-forward simulation on aligned OHLCV DataFrames.
         Returns (PairBacktestMetrics, equity_curve_df, list_of_SimulatedTrade).
         """
-        hp = StrategyHyperparams.for_horizon(pair.horizon)
+        hp = HorizonConfig.for_horizon(pair.horizon)
 
         # Align timestamps cleanly
         aligned = pd.DataFrame({
@@ -22855,7 +23134,7 @@ class HyperliquidPairsBacktester:
         else:
             f_x_aligned = pd.Series(fallback_funding_x, index=aligned.index)
 
-        kf = KalmanPairsFilter(delta=hp.kalman_delta, obs_noise_r=hp.obs_noise_r)
+        kf = KalmanPairsFilter(delta=hp.kalman_delta, obs_variance=hp.obs_noise_r)
         spread_history: List[float] = []
         y_hist: List[float] = []
         x_hist: List[float] = []
@@ -22918,10 +23197,15 @@ class HyperliquidPairsBacktester:
 
             # Periodic OU half-life calibration
             if (i - self.bt_cfg.warmup_bars) % self.bt_cfg.recheck_ou_every_bars == 0:
-                sp_arr = np.array(spread_history[-hp.ou_lookback_bars:], dtype=float)
-                _, cached_half_life, cached_is_stationary = estimate_ou_half_life(
-                    sp_arr, hp.bar_minutes
+                sp_arr = hedged_spread(
+                    np.array(y_hist[-hp.ou_lookback_bars:]),
+                    np.array(x_hist[-hp.ou_lookback_bars:]),
+                    state.beta,
+                    state.alpha,
                 )
+                gamma, hl_bars = estimate_ou_half_life(sp_arr)
+                cached_is_stationary = gamma < 0.0 and math.isfinite(hl_bars)
+                cached_half_life = hl_bars * hp.bar_minutes  # minutes
 
             # Rolling 24h return correlation
             if len(y_hist) >= corr_window_bars + 1:
@@ -23046,8 +23330,7 @@ class HyperliquidPairsBacktester:
                     side_y = 1.0 if signal_dir == "LONG_SPREAD" else -1.0
                     side_x = -side_y
 
-                    ny = effective_alloc / (1.0 + abs(state.beta))
-                    nx = abs(state.beta) * ny
+                    ny, nx = beta_neutral_notionals(effective_alloc, state.beta, py, px)
 
                     # Multi-day funding drag hurdle (reject if projected drag > 30% gross edge)
                     if pair.horizon == HorizonMode.MULTIDAY:
@@ -23056,7 +23339,7 @@ class HyperliquidPairsBacktester:
                         if net_hourly_funding < 0:
                             projected_drag = abs(net_hourly_funding) * expected_hold_hours
                             expected_gross_edge = (
-                                abs(state.z_score) * math.sqrt(state.forecast_var) / py
+                                abs(state.z_score) * state.forecast_std / py
                             ) * ny
                             if expected_gross_edge > 0 and projected_drag > 0.30 * expected_gross_edge:
                                 signal_dir = ""
@@ -23221,35 +23504,32 @@ class HyperliquidPairsBacktester:
 # ---------------------------------------------------------------------------
 
 def validate_discovered_pairs(
-    candidates: List[PairCandidate],
+    candidates: List[DiscoveredPair],
     horizon: HorizonMode = HorizonMode.MULTIDAY,
     lookback_days: int = 30,
     bt_config: Optional[BacktestConfig] = None,
+    data_client: Optional[HyperliquidDataClient] = None,
 ) -> pd.DataFrame:
     """
-    Takes output candidates from `HyperliquidPairScanner.scan_top_50()`,
+    Takes output candidates from `HyperliquidPairScanner.discover_pairs()`,
     fetches historical candles + hourly funding rates, runs walk-forward backtests,
     and returns a ranked DataFrame of funding-adjusted performance metrics.
     """
-    client = HyperliquidDataClient()
+    client = data_client or HyperliquidDataClient()
     backtester = HyperliquidPairsBacktester(data_client=client, bt_config=bt_config)
-    hp = StrategyHyperparams.for_horizon(horizon)
+    hp = HorizonConfig.for_horizon(horizon)
     lookback_hours = lookback_days * 24
+    lookback_bars = int(lookback_hours * 60 / hp.bar_minutes)
 
     now_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
     start_ms = now_ms - (lookback_hours * 3_600_000)
 
     results = []
     for cand in candidates:
-        pair_cfg = PairConfig(
-            leg_y=cand.leg_y,
-            leg_x=cand.leg_x,
-            asset_class=cand.asset_class,
-            horizon=horizon,
-        )
+        pair_cfg = cand.to_pair_config(horizon)
         try:
-            df_y = client.get_candles(cand.leg_y, hp.bar_interval, lookback_hours)
-            df_x = client.get_candles(cand.leg_x, hp.bar_interval, lookback_hours)
+            df_y = client.get_candles(cand.leg_y, hp.candle_interval, lookback_bars, end_time_ms=now_ms)
+            df_x = client.get_candles(cand.leg_x, hp.candle_interval, lookback_bars, end_time_ms=now_ms)
 
             f_y = pd.Series(dtype=float)
             f_x = pd.Series(dtype=float)
@@ -23317,7 +23597,7 @@ if __name__ == "__main__":
 
 ## 24. Hyperliquid Execution Controller (`hyperliquid_execution_controller.py`)
 
-`hyperliquid_execution_controller.py` — Two-leg order execution: post-only limit on the less liquid leg, then an IOC hedge on the liquid leg; paper mode by default.
+Two-leg order execution: post-only limit on the less liquid leg, then an IOC hedge on the liquid leg; paper mode by default.
 
 Save as `hyperliquid_execution_controller.py`.
 
@@ -23344,7 +23624,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import requests
 
-from pairs_strategy_engine import PairSignal, TradeDirection
+from pairs_strategy_engine import PairSignalOutput, SignalStatus
 
 logger = logging.getLogger("hyperliquid_execution_controller")
 logger.setLevel(logging.INFO)
@@ -23483,7 +23763,7 @@ class HyperliquidExecutionController:
         spec = self._asset_specs.get(symbol)
         decimals = spec.sz_decimals if spec else 3
         factor = 10 ** decimals
-        return math.floor(raw_size * factor) / factor
+        return round(math.floor(raw_size * factor + 1e-9) / factor, decimals)
 
     def _round_price(self, symbol: str, raw_price: float, is_buy: bool) -> float:
         spec = self._asset_specs.get(symbol)
@@ -23496,8 +23776,8 @@ class HyperliquidExecutionController:
             decimals = min(decimals, sig_decimals)
         factor = 10 ** decimals
         if is_buy:
-            return math.floor(raw_price * factor) / factor
-        return math.ceil(raw_price * factor) / factor
+            return round(math.floor(raw_price * factor + 1e-9) / factor, decimals)
+        return round(math.ceil(raw_price * factor - 1e-9) / factor, decimals)
 
     def fetch_l2_top_of_book(self, symbol: str) -> Tuple[float, float]:
         """Fetches best bid and best ask from Hyperliquid l2Book endpoint."""
@@ -23683,36 +23963,35 @@ class HyperliquidExecutionController:
             raw_response=res,
         )
 
-    def execute_pair_entry(self, signal: PairSignal) -> PairExecutionResult:
+    def execute_pair_entry(self, signal: PairSignalOutput) -> PairExecutionResult:
         """
-        Executes a validated PairSignal using sequential legging:
+        Executes an entry signal using sequential legging:
           1. Passive Post-Only Limit order on Leg Y (less liquid leg) at top-of-book.
-          2. Upon full or partial fill of Leg Y, immediately hedge exact filled notional
-             scaled by dynamic Kalman beta_t on Leg X via IOC order.
+          2. Upon full or partial fill of Leg Y, immediately hedge beta_t units of Leg X
+             per filled unit of Leg Y via IOC order.
+        Takes the PairSignalOutput from HyperliquidPairsStrategyEngine.evaluate_pair();
+        only LONG_SPREAD / SHORT_SPREAD signals are executed.
         """
-        if not signal.approved or signal.direction not in (
-            TradeDirection.LONG_SPREAD,
-            TradeDirection.SHORT_SPREAD,
-        ):
+        if signal.status not in (SignalStatus.LONG_SPREAD, SignalStatus.SHORT_SPREAD):
             return PairExecutionResult(
-                pair=signal.pair,
-                direction=signal.direction.value,
+                pair=signal.pair_id,
+                direction=signal.status.value,
                 paper_mode=self.paper_trading,
                 success=False,
                 leg_y_report=None,
                 leg_x_report=None,
                 effective_hedge_ratio=0.0,
-                message=f"Signal not actionable for entry: {signal.veto_reasons}",
+                message=f"Signal not actionable for entry: {signal.status.value} ({signal.reason})",
             )
 
-        is_buy_y = signal.direction == TradeDirection.LONG_SPREAD
+        is_buy_y = signal.status == SignalStatus.LONG_SPREAD
         is_buy_x = not is_buy_y
 
         best_bid_y, best_ask_y = self.fetch_l2_top_of_book(signal.leg_y)
         if best_bid_y <= 0 or best_ask_y <= 0:
             return PairExecutionResult(
-                pair=signal.pair,
-                direction=signal.direction.value,
+                pair=signal.pair_id,
+                direction=signal.status.value,
                 paper_mode=self.paper_trading,
                 success=False,
                 leg_y_report=None,
@@ -23735,8 +24014,8 @@ class HyperliquidExecutionController:
 
         if leg_y_rep.filled_size <= 0:
             return PairExecutionResult(
-                pair=signal.pair,
-                direction=signal.direction.value,
+                pair=signal.pair_id,
+                direction=signal.status.value,
                 paper_mode=self.paper_trading,
                 success=False,
                 leg_y_report=leg_y_rep,
@@ -23745,13 +24024,9 @@ class HyperliquidExecutionController:
                 message="Leg Y post-only order unfilled before timeout; aborted cleanly without legging risk.",
             )
 
-        # Compute exact hedge quantity on Leg X proportional to filled Leg Y notional
-        filled_notional_y = leg_y_rep.filled_size * leg_y_rep.avg_fill_price
-        target_notional_x = filled_notional_y * abs(signal.beta_t)
-
-        best_bid_x, best_ask_x = self.fetch_l2_top_of_book(signal.leg_x)
-        ref_px_x = best_ask_x if is_buy_x else best_bid_x
-        target_qty_x = target_notional_x / ref_px_x if ref_px_x > 0 else 0.0
+        # beta comes from the price regression Y = beta * X + alpha, so it is a unit ratio:
+        # hedge with beta units of X for every filled unit of Y.
+        target_qty_x = abs(signal.beta) * leg_y_rep.filled_size
 
         leg_x_rep = self._place_ioc_hedge(
             symbol=signal.leg_x,
@@ -23770,8 +24045,8 @@ class HyperliquidExecutionController:
                 reduce_only=True,
             )
             return PairExecutionResult(
-                pair=signal.pair,
-                direction=signal.direction.value,
+                pair=signal.pair_id,
+                direction=signal.status.value,
                 paper_mode=self.paper_trading,
                 success=False,
                 leg_y_report=leg_y_rep,
@@ -23780,12 +24055,12 @@ class HyperliquidExecutionController:
                 message="Leg X hedge failed; emergency unwound Leg Y.",
             )
 
-        filled_notional_x = leg_x_rep.filled_size * leg_x_rep.avg_fill_price
-        eff_beta = filled_notional_x / filled_notional_y if filled_notional_y > 0 else 0.0
+        # Realised hedge ratio in the same units as beta (units of X per unit of Y)
+        eff_beta = leg_x_rep.filled_size / leg_y_rep.filled_size if leg_y_rep.filled_size > 0 else 0.0
 
         return PairExecutionResult(
-            pair=signal.pair,
-            direction=signal.direction.value,
+            pair=signal.pair_id,
+            direction=signal.status.value,
             paper_mode=self.paper_trading,
             success=True,
             leg_y_report=leg_y_rep,
@@ -23845,4 +24120,163 @@ class HyperliquidExecutionController:
             effective_hedge_ratio=0.0,
             message="Mean-reversion exit completed.",
         )
+```
+
+---
+
+## 25. End-to-End Runner (`run_trading_engine.py`)
+
+Wires sections 21–24 together: scan, backtest, keep validated pairs, then poll signals and paper-trade entries and exits.
+
+Save as `run_trading_engine.py`.
+
+```python
+"""
+Hyperliquid Pairs Trading Engine: End-to-End Runner
+---------------------------------------------------
+Wires the four modules together:
+  1. HyperliquidPairScanner       -> find cointegrated pairs in the top-volume perps
+  2. validate_discovered_pairs    -> walk-forward backtest; keep only pairs that pass
+  3. HyperliquidPairsStrategyEngine -> live Kalman / OU / funding / hours signals
+  4. HyperliquidExecutionController -> legged entries and exits (PAPER mode by default)
+
+Save next to pairs_strategy_engine.py, hyperliquid_pair_scanner.py,
+hyperliquid_pairs_backtester.py and hyperliquid_execution_controller.py, then run:
+    python run_trading_engine.py
+Paper mode sends no orders; it reads Hyperliquid's public market data only.
+"""
+
+from __future__ import annotations
+
+import logging
+import os
+import time
+from typing import Dict, List
+
+from pairs_strategy_engine import (
+    AssetBucket,
+    HorizonConfig,
+    HorizonMode,
+    HyperliquidPairsStrategyEngine,
+    PairSpec,
+    SignalStatus,
+)
+from hyperliquid_pair_scanner import HyperliquidPairScanner
+from hyperliquid_pairs_backtester import BacktestConfig, validate_discovered_pairs
+from hyperliquid_execution_controller import HyperliquidExecutionController
+
+logger = logging.getLogger("run_trading_engine")
+
+# ---- Settings -------------------------------------------------------------
+HORIZON = HorizonMode.MULTIDAY      # or HorizonMode.INTRADAY (5m bars)
+PORTFOLIO_EQUITY = 10_000.0         # USDC
+CAPITAL_PER_PAIR = 2_000.0          # USDC per pair (both legs together)
+MAX_PAIRS = 3                       # trade at most this many validated pairs
+BACKTEST_DAYS = 60
+PAPER_TRADING = True                # False sends REAL orders: needs HL_PRIVATE_KEY set
+
+ENTRY = (SignalStatus.LONG_SPREAD, SignalStatus.SHORT_SPREAD)
+EXIT = (SignalStatus.EXIT_MEAN, SignalStatus.STOP_LOSS, SignalStatus.HALT_REGIME_BREAK)
+
+
+def select_pairs() -> List[PairSpec]:
+    """Scan, backtest, and return engine specs for the pairs that passed validation."""
+    scanner = HyperliquidPairScanner()
+    candidates = scanner.discover_pairs(mode=HORIZON, top_n=50, lookback_bars=500)
+    logger.info("Scanner found %d cointegrated pairs", len(candidates))
+    if not candidates:
+        return []
+
+    summary = validate_discovered_pairs(
+        candidates,
+        horizon=HORIZON,
+        lookback_days=BACKTEST_DAYS,
+        bt_config=BacktestConfig(initial_capital=PORTFOLIO_EQUITY, allocation_per_pair=CAPITAL_PER_PAIR),
+    )
+    if summary.empty:
+        return []
+    print(summary[["pair_label", "asset_class", "total_trades", "net_pnl_usdc",
+                   "sharpe_ratio", "max_drawdown_pct", "passed_validation"]].to_string(index=False))
+
+    passed = set(summary.loc[summary["passed_validation"], "pair_label"])
+    chosen = [c for c in candidates if f"{c.leg_y}/{c.leg_x}" in passed][:MAX_PAIRS]
+    return [c.to_pair_spec(HORIZON, CAPITAL_PER_PAIR) for c in chosen]
+
+
+def run_once(
+    engine: HyperliquidPairsStrategyEngine,
+    controller: HyperliquidExecutionController,
+    specs: List[PairSpec],
+) -> List[str]:
+    """One polling cycle: evaluate every pair, then enter / exit as signalled."""
+    supervisor = engine.risk_supervisor
+    by_id: Dict[str, PairSpec] = {s.pair_id: s for s in specs}
+    actions: List[str] = []
+
+    for sig in engine.scan_universe(specs):
+        spec = by_id[sig.pair_id]
+        pos = supervisor.active_positions.get(spec.pair_id)
+
+        # Intraday stock pairs must be flat outside NYSE hours (spec: force-close by 15:55 EST)
+        if pos and spec.bucket == AssetBucket.STOCK_PERP and spec.horizon == HorizonMode.INTRADAY:
+            allowed, _, _ = supervisor.check_stock_perp_hours(spec.bucket, spec.horizon)
+            if not allowed:
+                sig.status = SignalStatus.STOP_LOSS
+                sig.reason = "End-of-session close for intraday stock pair"
+
+        if sig.status in ENTRY and pos is None:
+            res = controller.execute_pair_entry(sig)
+            if res.success:
+                y, x = res.leg_y_report, res.leg_x_report
+                supervisor.open_position(
+                    spec,
+                    side=1 if sig.status == SignalStatus.LONG_SPREAD else -1,
+                    notional_y=y.filled_size * y.avg_fill_price,
+                    notional_x=x.filled_size * x.avg_fill_price,
+                    qty_y=y.filled_size,
+                    qty_x=x.filled_size,
+                )
+            actions.append(f"{spec.pair_id}: {sig.status.value} z={sig.z_score:+.2f} -> {res.message}")
+
+        elif sig.status in EXIT and pos is not None:
+            res = controller.close_pair_position(
+                spec.leg_y, spec.leg_x, pos["qty_y"], pos["qty_x"],
+                is_long_spread=pos["side"] == 1,
+                emergency=sig.status != SignalStatus.EXIT_MEAN,
+            )
+            if res.success:
+                supervisor.close_position(spec.pair_id)
+            actions.append(f"{spec.pair_id}: {sig.status.value} z={sig.z_score:+.2f} -> {res.message}")
+
+        else:
+            logger.info("%s: %s z=%+.2f (%s)", spec.pair_id, sig.status.value, sig.z_score, sig.reason)
+
+    return actions
+
+
+def main(max_cycles: int | None = None) -> None:
+    specs = select_pairs()
+    if not specs:
+        print("No pair passed backtest validation; nothing to trade.")
+        return
+    print("Trading:", [s.pair_id for s in specs])
+
+    controller = HyperliquidExecutionController(
+        paper_trading=PAPER_TRADING,
+        private_key=None if PAPER_TRADING else os.environ["HL_PRIVATE_KEY"],
+    )
+    engine = HyperliquidPairsStrategyEngine(total_portfolio_equity=PORTFOLIO_EQUITY)
+    poll_seconds = HorizonConfig.for_horizon(HORIZON).bar_minutes * 60  # once per bar
+
+    cycle = 0
+    while max_cycles is None or cycle < max_cycles:
+        for line in run_once(engine, controller, specs):
+            print(line)
+        cycle += 1
+        if max_cycles is None or cycle < max_cycles:
+            time.sleep(poll_seconds)
+
+
+if __name__ == "__main__":
+    main()
 ```
